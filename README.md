@@ -69,7 +69,17 @@ pivx-agent-kit export                            Export wallet seed phrase for m
 
 All commands output JSON to stdout. Status/progress goes to stderr. Errors return JSON to stderr with exit code 1.
 
-## Building
+## Install
+
+One-liner:
+
+```bash
+curl -sSf https://raw.githubusercontent.com/PIVX-Labs/pivx-agent-kit/master/install.sh | sh
+```
+
+Pre-built binaries for Linux (x86_64, aarch64), macOS (Intel, Apple Silicon), and Windows are available on the [releases page](https://github.com/PIVX-Labs/pivx-agent-kit/releases).
+
+## Building from source
 
 Requires Rust 1.70+.
 
