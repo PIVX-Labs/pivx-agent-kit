@@ -58,15 +58,17 @@ fn find_checksum(checksums_txt: &str, filename: &str) -> Option<String> {
 }
 
 fn extract_tar_gz(archive: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
-    let mut child = Command::new("tar")
-        .args(["xzf", "-", "-O", "pivx-agent-kit"])
-        .stdin(Stdio::piped())
+    // Write archive to a temp file to avoid pipe deadlock with large archives
+    let tmp = std::env::temp_dir().join("pivx-update.tar.gz");
+    fs::write(&tmp, archive)?;
+
+    let output = Command::new("tar")
+        .args(["xzf", &tmp.to_string_lossy(), "-O", "pivx-agent-kit"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .output()?;
 
-    child.stdin.take().unwrap().write_all(archive)?;
-    let output = child.wait_with_output()?;
+    let _ = fs::remove_file(&tmp);
 
     if output.status.success() && !output.stdout.is_empty() {
         Ok(output.stdout)
