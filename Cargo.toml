@@ -1,6 +1,6 @@
 [package]
 name = "pivx-agent-kit"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "PIVX Agent Kit – CLI toolbox for AI agents to interact with the PIVX blockchain"
 repository = "https://github.com/PIVX-Labs/pivx-agent-kit"

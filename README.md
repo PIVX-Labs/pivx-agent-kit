@@ -1,6 +1,6 @@
 # PIVX Agent Kit
 
-A lightweight CLI that gives AI agents their own shielded cryptocurrency wallet on the [PIVX](https://pivx.org) blockchain.
+A lightweight CLI and MCP server that gives AI agents their own shielded cryptocurrency wallet on the [PIVX](https://pivx.org) blockchain.
 
 Built in pure Rust. Full zkSNARK privacy via the SHIELD (Sapling) protocol.
 
@@ -15,42 +15,60 @@ PIVX Agent Kit is purpose-built for agents: a single binary, structured JSON out
 
 All transactions use SHIELD — PIVX's zero-knowledge privacy protocol. Balances, amounts, and memo contents are encrypted on-chain and only visible to the wallet holder.
 
+## Install
+
+**Claude Code:**
+
+```bash
+curl -sSf https://raw.githubusercontent.com/PIVX-Labs/pivx-agent-kit/master/install.sh | sh
+claude mcp add --scope user pivx pivx-agent-kit serve
+```
+
+The first line installs the binary. The second registers it as an MCP server available across all projects. Restart your session and the PIVX tools appear natively.
+
+**Other MCP-compatible agents** (OpenCode, Cursor, Cline, etc.) — install the binary, then add this to your MCP configuration:
+
+```json
+{
+  "mcpServers": {
+    "pivx": {
+      "command": "pivx-agent-kit",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+**CLI only** (no MCP) — just install the binary and use the commands directly.
+
+Pre-built binaries for Linux (x86_64, aarch64), macOS (Intel, Apple Silicon), and Windows are available on the [releases page](https://github.com/PIVX-Labs/pivx-agent-kit/releases).
+
 ## For agents
 
-You can create a wallet, check your balance, send PIV, and read encrypted memos — all through simple CLI commands that return JSON.
+Once installed, you have native tools for wallet management. Via MCP, they appear as `pivx_init`, `pivx_balance`, `pivx_send`, etc. Via CLI, the same operations are available as commands.
 
+**MCP example:**
 ```
-$ pivx-agent-kit init
-{
-  "status": "created",
-  "address": "ps1...",
-  "birthday_height": 5236346
-}
+tool: pivx_balance
+→ { "balance": 30.34, "messages": [{ "memo": "Hello!", "amount": 1.0 }] }
 
+tool: pivx_send { "address": "ps1...", "amount": "0.5", "memo": "Thanks!" }
+→ { "status": "sent", "txid": "6f3d...", "amount": 0.5, "fee": 0.02365 }
+```
+
+**CLI example:**
+```
 $ pivx-agent-kit balance
-{
-  "address": "ps1...",
-  "balance": 2.47635,
-  "balance_sat": 247635000,
-  "unspent_notes": 2,
-  "messages": [
-    { "memo": "Hello from a human!", "amount": 1.0 }
-  ]
-}
+{ "balance": 30.34, "messages": [{ "memo": "Hello!", "amount": 1.0 }] }
 
-$ pivx-agent-kit send ps1... 0.5 "Thanks for the PIV!"
-{
-  "status": "sent",
-  "txid": "6f3d...",
-  "amount": 0.5,
-  "fee": 0.02365
-}
+$ pivx-agent-kit send ps1... 0.5 "Thanks!"
+{ "status": "sent", "txid": "6f3d...", "amount": 0.5, "fee": 0.02365 }
 ```
 
 **Best practices:**
 - Both `balance` and `send` auto-sync to the chain tip before executing. No need to sync manually.
 - The `messages` field in `balance` output contains encrypted memos attached to received funds. Check it to read communications from humans or other agents.
-- Amounts are exact — use decimal strings like `0.1`, not floats. The CLI parses them with integer precision (no floating-point rounding).
+- Amounts are exact — use decimal strings like `0.1`, not floats. Parsed with integer precision (no floating-point rounding).
 - Memos can be up to 512 bytes of UTF-8 text (emoji and unicode work). Use them for payment references, instructions, or communication.
 - If the commitment tree becomes corrupted, it is detected and repaired automatically during sync. You can also run `resync` to manually force a full re-sync from checkpoint.
 - Your seed phrase is stored securely in the data directory and is never output by any command. The spending key is derived on-the-fly when needed and zeroized from memory after use.
@@ -65,19 +83,10 @@ pivx-agent-kit balance                           Sync and show wallet balance
 pivx-agent-kit send <address> <amount> [memo]    Send PIV to an address
 pivx-agent-kit resync                            Reset and re-sync shield data from checkpoint
 pivx-agent-kit export                            Export wallet seed phrase for migration
+pivx-agent-kit serve                             Run as MCP server (for AI agent integration)
 ```
 
 All commands output JSON to stdout. Status/progress goes to stderr. Errors return JSON to stderr with exit code 1.
-
-## Install
-
-One-liner:
-
-```bash
-curl -sSf https://raw.githubusercontent.com/PIVX-Labs/pivx-agent-kit/master/install.sh | sh
-```
-
-Pre-built binaries for Linux (x86_64, aarch64), macOS (Intel, Apple Silicon), and Windows are available on the [releases page](https://github.com/PIVX-Labs/pivx-agent-kit/releases).
 
 ## Building from source
 
@@ -105,7 +114,7 @@ The first time you run `send`, the Sapling proving parameters (~50 MB) are downl
 - `wallet.json` — sync state, viewing key, and encrypted notes (chmod 600 on Unix)
 - `params/` — cached Sapling proving parameters
 
-The seed and mnemonic in the wallet file are encrypted with a device-bound key — they cannot be read on any other machine. The extended spending key is not stored — it is derived from the seed on-the-fly when needed and zeroized from memory immediately after. To migrate a wallet to another device, use `import` with the mnemonic phrase.
+The seed and mnemonic in the wallet file are encrypted with a device-bound key — they cannot be read on any other machine. The extended spending key is not stored — it is derived from the seed on-the-fly when needed and zeroized from memory immediately after. To migrate a wallet to another device, use `export` to retrieve the seed phrase, then `import` on the new device.
 
 ## Security model
 
@@ -136,8 +145,10 @@ The seed and mnemonic in the wallet file are encrypted with a device-bound key �
 
 ```
 pivx-agent-kit
-├── main.rs            CLI entry, command dispatch, amount parsing
-├── wallet.rs          Wallet state, creation, persistence, zeroization
+├── main.rs            CLI entry, command dispatch
+├── core.rs            Shared wallet operations (used by both CLI and MCP)
+├── mcp.rs             MCP server (JSON-RPC over stdin/stdout)
+├── wallet.rs          Wallet state, creation, persistence, device encryption
 ├── keys.rs            Sapling key derivation and encoding
 ├── shield.rs          Block processing, note decryption, transaction building
 ├── sync.rs            Binary shield stream parser, sync orchestration
