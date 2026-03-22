@@ -8,6 +8,7 @@ mod prover;
 mod shield;
 mod simd;
 mod sync;
+mod updater;
 mod wallet;
 
 use serde_json::json;
@@ -30,7 +31,8 @@ Commands:
   send <address> <amount> [memo]    Send PIV to an address
   resync                            Reset and re-sync shield data from checkpoint
   export                            Export wallet seed phrase for migration
-  serve                             Run as MCP server (for AI agent integration)", VERSION)
+  serve                             Run as MCP server (for AI agent integration)
+  update                            Update to the latest release", VERSION)
 }
 
 fn main() {
@@ -43,6 +45,7 @@ fn main() {
     }
 
     let result = match args.first().map(|s| s.as_str()) {
+        Some("update") => updater::update(),
         Some("init") => core::init(),
         Some("import") => {
             let mnemonic = args.get(1..).map(|words| words.join(" "));
