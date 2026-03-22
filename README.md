@@ -9,7 +9,7 @@ Built in pure Rust. Full zkSNARK privacy via the SHIELD (Sapling) protocol.
 AI agents are becoming economic actors — they need to send, receive, and hold value. Existing PIVX wallet options don't fit:
 
 - **PIVX Core** is a full node. It syncs the entire blockchain (~20 GB), requires hours of setup, and runs a persistent daemon. Agents need something they can call and get a JSON answer.
-- **MyPIVXWallet** runs in a browser with a JavaScript UI. Agents don't have browsers.
+- **MyPIVXWallet** runs in a browser with a JavaScript UI. Agents can access browsers through MCPs, but driving a visual wallet through browser automation is slow, fragile, and wasteful for a text-based LLM.
 
 PIVX Agent Kit is purpose-built for agents: a single binary, structured JSON output, no GUI, no daemon, no full chain sync. A new wallet syncs in seconds using checkpoint fast-path, and every command returns machine-readable output that agents can parse directly.
 
