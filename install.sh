@@ -31,14 +31,34 @@ if [ -z "$LATEST" ]; then
     exit 1
 fi
 
-URL="https://github.com/${REPO}/releases/download/${LATEST}/pivx-agent-kit-${NAME}.tar.gz"
+ARCHIVE="pivx-agent-kit-${NAME}.tar.gz"
+TMPDIR=$(mktemp -d)
 
 echo "Installing pivx-agent-kit ${LATEST} (${NAME})..."
 
-# Download and extract
-TMPDIR=$(mktemp -d)
-curl -sSfL "$URL" -o "${TMPDIR}/pivx-agent-kit.tar.gz"
-tar xzf "${TMPDIR}/pivx-agent-kit.tar.gz" -C "$TMPDIR"
+# Download archive and checksums
+curl -sSfL "https://github.com/${REPO}/releases/download/${LATEST}/${ARCHIVE}" -o "${TMPDIR}/${ARCHIVE}"
+curl -sSfL "https://github.com/${REPO}/releases/download/${LATEST}/checksums.txt" -o "${TMPDIR}/checksums.txt"
+
+# Verify SHA256
+EXPECTED=$(grep "${ARCHIVE}" "${TMPDIR}/checksums.txt" | awk '{print $1}')
+ACTUAL=$(sha256sum "${TMPDIR}/${ARCHIVE}" 2>/dev/null || shasum -a 256 "${TMPDIR}/${ARCHIVE}" | awk '{print $1}')
+ACTUAL=$(echo "$ACTUAL" | awk '{print $1}')
+
+if [ -z "$EXPECTED" ]; then
+    echo "Warning: no checksum found for ${ARCHIVE}"
+elif [ "$ACTUAL" != "$EXPECTED" ]; then
+    echo "Checksum verification FAILED — download may be corrupted or tampered."
+    echo "  expected: $EXPECTED"
+    echo "  got:      $ACTUAL"
+    rm -rf "$TMPDIR"
+    exit 1
+else
+    echo "Checksum verified."
+fi
+
+# Extract
+tar xzf "${TMPDIR}/${ARCHIVE}" -C "$TMPDIR"
 
 # Install
 if [ -w "$INSTALL_DIR" ]; then
