@@ -323,7 +323,7 @@ pub fn create_shield_transaction(
     let mut nullifiers = vec![];
     let mut sapling_input_count = 0u64;
     let mut fee = 0u64;
-    let mut amount = amount;
+    let amount = amount;
 
     for (note, witness_hex, _) in &notes {
         let witness = read_incremental_witness::<Node, _, DEPTH>(Cursor::new(

@@ -14,7 +14,7 @@ const SAVE_INTERVAL: u32 = 10;
 
 /// Parse a 4-byte little-endian length from a reader
 #[inline]
-fn read_u32_le(reader: &mut (dyn Read)) -> Result<Option<u32>, Box<dyn Error>> {
+fn read_u32_le(reader: &mut dyn Read) -> Result<Option<u32>, Box<dyn Error>> {
     let mut buf = [0u8; 4];
     match reader.read_exact(&mut buf) {
         Ok(()) => Ok(Some(u32::from_le_bytes(buf))),
@@ -30,7 +30,7 @@ struct RawBlock {
 
 /// Parse the next batch of blocks from the binary stream.
 fn parse_next_blocks(
-    reader: &mut (dyn Read),
+    reader: &mut dyn Read,
     max_blocks: usize,
 ) -> Result<Option<Vec<RawBlock>>, Box<dyn Error>> {
     let mut txs: Vec<Vec<u8>> = vec![];
@@ -77,7 +77,7 @@ fn parse_next_blocks(
 
 /// Process blocks from a stream reader into the wallet state.
 fn sync_stream(
-    reader: &mut (dyn Read),
+    reader: &mut dyn Read,
     wallet: &mut WalletData,
     total_blocks: &mut u32,
     batches_since_save: &mut u32,
