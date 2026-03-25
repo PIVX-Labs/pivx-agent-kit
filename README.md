@@ -20,7 +20,7 @@ All transactions use SHIELD — PIVX's zero-knowledge privacy protocol. Balances
 **Claude Code:**
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/PIVX-Labs/pivx-agent-kit/master/install.sh | sh
+curl -sSf https://install.pivx.ai | sh
 claude mcp add --scope user pivx pivx-agent-kit serve
 ```
 
