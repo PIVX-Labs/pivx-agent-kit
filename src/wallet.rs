@@ -18,6 +18,8 @@ pub struct SerializedNote {
     pub witness: String,         // hex-encoded incremental witness
     pub nullifier: String,       // hex-encoded nullifier
     pub memo: Option<String>,
+    #[serde(default)]
+    pub height: u32,             // block height when note was received
 }
 
 /// Persistent wallet state.

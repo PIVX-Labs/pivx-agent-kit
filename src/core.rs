@@ -7,6 +7,7 @@ use std::error::Error;
 
 pub type Result = std::result::Result<serde_json::Value, Box<dyn Error>>;
 
+
 /// Parse a PIV amount string to satoshis with exact integer precision
 pub fn parse_piv_to_sat(s: &str) -> std::result::Result<u64, String> {
     let s = s.trim();
@@ -196,6 +197,7 @@ pub fn balance() -> Result {
             Some(json!({
                 "memo": memo,
                 "amount": value as f64 / 1e8,
+                "block": n.height,
             }))
         })
         .collect();

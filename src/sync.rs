@@ -91,7 +91,7 @@ fn sync_stream(
         let shield_blocks: Vec<ShieldBlock> = raw_blocks
             .iter()
             .filter(|b| b.height as i32 > wallet.last_block)
-            .map(|b| ShieldBlock { txs: b.txs.clone() })
+            .map(|b| ShieldBlock { height: b.height, txs: b.txs.clone() })
             .collect();
 
         if shield_blocks.is_empty() {

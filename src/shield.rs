@@ -37,6 +37,7 @@ struct SpendableNote {
     witness: IncrementalWitness<Node, DEPTH>,
     nullifier: String,
     memo: Option<String>,
+    height: u32,
 }
 
 impl SpendableNote {
@@ -49,6 +50,7 @@ impl SpendableNote {
             witness,
             nullifier: n.nullifier.clone(),
             memo: n.memo.clone(),
+            height: n.height,
         })
     }
 
@@ -60,6 +62,7 @@ impl SpendableNote {
             witness: crate::simd::hex::bytes_to_hex_string(&buf),
             nullifier: self.nullifier.clone(),
             memo: self.memo.clone(),
+            height: self.height,
         })
     }
 }
@@ -78,6 +81,7 @@ pub struct HandleBlocksResult {
 
 /// Block structure for processing — txs are raw bytes (no hex round-trip)
 pub struct ShieldBlock {
+    pub height: u32,
     pub txs: Vec<Vec<u8>>,
 }
 
@@ -120,6 +124,7 @@ pub fn handle_blocks(
                 &nullif_key,
                 &mut comp_notes,
                 &mut new_notes,
+                block.height,
             )?;
             let tx_nullifier_strs: Vec<String> = tx_nullifiers
                 .iter()
@@ -159,6 +164,7 @@ fn handle_transaction(
     nullif_key: &NullifierDerivingKey,
     existing_witnesses: &mut Vec<SpendableNote>,
     new_witnesses: &mut Vec<SpendableNote>,
+    block_height: u32,
 ) -> Result<Vec<Nullifier>, Box<dyn Error>> {
     let tx = Transaction::read(
         Cursor::new(tx_bytes),
@@ -203,6 +209,7 @@ fn handle_transaction(
                         witness,
                         nullifier,
                         memo,
+                        height: block_height,
                     });
                     break;
                 }
