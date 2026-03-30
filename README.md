@@ -1,8 +1,8 @@
 # PIVX Agent Kit
 
-A lightweight CLI and MCP server that gives AI agents their own shielded cryptocurrency wallet on the [PIVX](https://pivx.org) blockchain.
+A lightweight CLI and MCP server that gives AI agents their own cryptocurrency wallet on the [PIVX](https://pivx.org) blockchain.
 
-Built in pure Rust. Full zkSNARK privacy via the SHIELD (Sapling) protocol.
+Built in pure Rust. Supports both **transparent** (public) and **SHIELD** (private, zkSNARK) transactions from a single seed phrase.
 
 ## Why this exists
 
@@ -13,7 +13,7 @@ AI agents are becoming economic actors — they need to send, receive, and hold 
 
 PIVX Agent Kit is purpose-built for agents: a single binary, structured JSON output, no GUI, no daemon, no full chain sync. A new wallet syncs in seconds using checkpoint fast-path, and every command returns machine-readable output that agents can parse directly.
 
-All transactions use SHIELD — PIVX's zero-knowledge privacy protocol. Balances, amounts, and memo contents are encrypted on-chain and only visible to the wallet holder.
+**Dual balance model:** One seed phrase derives both a transparent (public, `D...`) address and a shield (private, `ps1...`) address. You choose which balance to spend from.
 
 ## Install
 
@@ -50,43 +50,56 @@ Once installed, you have native tools for wallet management. Via MCP, they appea
 **MCP example:**
 ```
 tool: pivx_balance
-→ { "balance": 30.34, "messages": [{ "memo": "Hello!", "amount": 1.0 }] }
+→ { "private_balance": 30.0, "public_balance": 1.5, "total_balance": 31.5 }
 
-tool: pivx_send { "address": "ps1...", "amount": "0.5", "memo": "Thanks!" }
-→ { "status": "sent", "txid": "6f3d...", "amount": 0.5, "fee": 0.02365 }
+tool: pivx_send { "address": "D...", "amount": "0.5", "from": "private" }
+→ { "status": "sent", "txid": "6f3d...", "from": "private", "amount": 0.5, "fee": 0.02365 }
 ```
 
 **CLI example:**
 ```
 $ pivx-agent-kit balance
-{ "balance": 30.34, "messages": [{ "memo": "Hello!", "amount": 1.0 }] }
+{ "private_balance": 30.0, "public_balance": 1.5, "total_balance": 31.5 }
 
-$ pivx-agent-kit send ps1... 0.5 "Thanks!"
-{ "status": "sent", "txid": "6f3d...", "amount": 0.5, "fee": 0.02365 }
+$ pivx-agent-kit send D... 0.5 --from public
+{ "status": "sent", "txid": "a1b2...", "from": "public", "amount": 0.5, "fee": 0.0000228 }
 ```
 
 **Best practices:**
 - Both `balance` and `send` auto-sync to the chain tip before executing. No need to sync manually.
-- The `messages` field in `balance` output contains encrypted memos attached to received funds. Check it to read communications from humans or other agents.
-- Amounts are exact — use decimal strings like `0.1`, not floats. Parsed with integer precision (no floating-point rounding).
-- Memos can be up to 512 bytes of UTF-8 text (emoji and unicode work). Use them for payment references, instructions, or communication.
-- If the commitment tree becomes corrupted, it is detected and repaired automatically during sync. You can also run `resync` to manually force a full re-sync from checkpoint.
-- Your seed phrase is stored securely in the data directory and is never output by any command. The spending key is derived on-the-fly when needed and zeroized from memory after use.
+- The `messages` field in `balance` output contains encrypted memos attached to received shield funds.
+- Use `--from private` to spend from the shield balance, `--from public` for the transparent balance.
+- Amounts are exact — use decimal strings like `0.1`, not floats. Parsed with integer precision.
+- Memos can be up to 512 bytes of UTF-8 text (private-to-private only).
+- Your seed phrase is stored securely and is never output by any command except `export`.
 
 ## Commands
 
 ```
-pivx-agent-kit init                              Create a new shielded wallet
-pivx-agent-kit import <word1 word2 ... word24>   Import wallet from seed phrase
-pivx-agent-kit address                           Show the shield receiving address
-pivx-agent-kit balance                           Sync and show wallet balance
-pivx-agent-kit send <address> <amount> [memo]    Send PIV to an address
-pivx-agent-kit resync                            Reset and re-sync shield data from checkpoint
-pivx-agent-kit export                            Export wallet seed phrase for migration
-pivx-agent-kit serve                             Run as MCP server (for AI agent integration)
+pivx-agent-kit init                                          Create a new wallet
+pivx-agent-kit import <word1 word2 ... word24>               Import wallet from seed phrase
+pivx-agent-kit address                                       Show shield + transparent addresses
+pivx-agent-kit balance                                       Sync and show private + public balances
+pivx-agent-kit send <address> <amount> --from <private|public> [memo]
+                                                             Send PIV from specified balance
+pivx-agent-kit resync                                        Reset and re-sync from checkpoint
+pivx-agent-kit export                                        Export wallet seed phrase for migration
+pivx-agent-kit serve                                         Run as MCP server
+pivx-agent-kit update                                        Update to latest release
 ```
 
 All commands output JSON to stdout. Status/progress goes to stderr. Errors return JSON to stderr with exit code 1.
+
+### Transaction types
+
+All four directions are supported:
+
+| From | To | Method |
+|------|----|--------|
+| Private (Shield) | Shield address | `--from private` |
+| Private (Shield) | Transparent address | `--from private` |
+| Public (Transparent) | Transparent address | `--from public` |
+| Public (Transparent) | Shield address | `--from public` (shielding) |
 
 ## Building from source
 
@@ -111,7 +124,7 @@ The first time you run `send`, the Sapling proving parameters (~50 MB) are downl
 | Windows  | `%APPDATA%/pivx-agent-kit/` |
 
 **Files:**
-- `wallet.json` — sync state, viewing key, and encrypted notes (chmod 600 on Unix)
+- `wallet.json` — sync state, viewing key, encrypted notes + UTXOs (chmod 600 on Unix)
 - `params/` — cached Sapling proving parameters
 
 The seed and mnemonic in the wallet file are encrypted with a device-bound key — they cannot be read on any other machine. The extended spending key is not stored — it is derived from the seed on-the-fly when needed and zeroized from memory immediately after. To migrate a wallet to another device, use `export` to retrieve the seed phrase, then `import` on the new device.
@@ -130,17 +143,6 @@ The seed and mnemonic in the wallet file are encrypted with a device-bound key �
 - **Auto-healing** — if corruption is detected, the wallet automatically resets to checkpoint and re-syncs without manual intervention.
 - **Checkpoint recovery** — `resync` resets to the wallet's birthday checkpoint and rebuilds all state from the blockchain.
 
-**Threat model — what this protects against:**
-- Cloud backup leaks (file is encrypted with a device-specific key)
-- Disk image extraction or VM snapshot cloning
-- Agent accidentally reading or outputting the wallet file
-- Process crashes leaking keys from memory
-- Corrupted sync state from network issues or disk errors
-
-**What this does NOT protect against:**
-- An attacker with shell access on the same device (they can run the binary directly)
-- Physical access to an unlocked machine
-
 ## Architecture
 
 ```
@@ -149,9 +151,9 @@ pivx-agent-kit
 ├── core.rs            Shared wallet operations (used by both CLI and MCP)
 ├── mcp.rs             MCP server (JSON-RPC over stdin/stdout)
 ├── wallet.rs          Wallet state, creation, persistence, device encryption
-├── keys.rs            Sapling key derivation and encoding
-├── shield.rs          Block processing, note decryption, transaction building
-├── sync.rs            Binary shield stream parser, sync orchestration
+├── keys.rs            Key derivation (Sapling + BIP32 transparent)
+├── shield.rs          Block processing, note decryption, shield + transparent tx building
+├── sync.rs            Binary shield stream parser, transparent UTXO sync
 ├── network.rs         HTTP client for PIVX RPC and Blockbook APIs
 ├── prover.rs          Sapling proving parameter management
 ├── checkpoint.rs      Pre-computed commitment tree checkpoints
