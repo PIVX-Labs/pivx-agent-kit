@@ -42,7 +42,7 @@ pub fn parse_piv_to_sat(s: &str) -> std::result::Result<u64, String> {
         .ok_or_else(|| "Amount overflow".to_string())
 }
 
-/// Sync wallet to the chain tip. Saves to disk if blocks were processed.
+/// Sync wallet to the chain tip (both shield and transparent). Saves to disk if blocks were processed.
 pub fn sync(wallet_data: &mut wallet::WalletData) -> std::result::Result<(), Box<dyn Error>> {
     let net = network::PivxNetwork::new();
     let block_count = net.get_block_count()?;
@@ -54,6 +54,12 @@ pub fn sync(wallet_data: &mut wallet::WalletData) -> std::result::Result<(), Box
         wallet::save_wallet(wallet_data)?;
         eprintln!("Sync complete.");
     }
+
+    // Transparent UTXO sync (fast — just a single API call)
+    if let Err(e) = sync::sync_transparent(wallet_data, &net) {
+        eprintln!("Transparent sync warning: {}", e);
+    }
+
     Ok(())
 }
 
@@ -65,15 +71,17 @@ pub fn init() -> Result {
     let wallet_data = wallet::create_new_wallet()?;
     wallet::save_wallet(&wallet_data)?;
 
-    let address = keys::get_default_address(&wallet_data.extfvk)?;
+    let shield_address = keys::get_default_address(&wallet_data.extfvk)?;
+    let transparent_address = wallet_data.get_transparent_address()?;
     let data_dir = wallet::get_data_dir();
 
     Ok(json!({
         "status": "created",
-        "address": address,
+        "shield_address": shield_address,
+        "transparent_address": transparent_address,
         "birthday_height": wallet_data.last_block,
         "data_dir": data_dir.to_string_lossy(),
-        "note": "Seed phrase saved securely in data directory. Access the wallet file directly for backup."
+        "note": "Seed phrase saved securely in data directory."
     }))
 }
 
@@ -85,12 +93,14 @@ pub fn import(mnemonic: &str) -> Result {
     let wallet_data = wallet::import_wallet(mnemonic)?;
     wallet::save_wallet(&wallet_data)?;
 
-    let address = keys::get_default_address(&wallet_data.extfvk)?;
+    let shield_address = keys::get_default_address(&wallet_data.extfvk)?;
+    let transparent_address = wallet_data.get_transparent_address()?;
     let data_dir = wallet::get_data_dir();
 
     Ok(json!({
         "status": "imported",
-        "address": address,
+        "shield_address": shield_address,
+        "transparent_address": transparent_address,
         "birthday_height": wallet_data.last_block,
         "data_dir": data_dir.to_string_lossy(),
         "note": "Wallet imported. Run 'balance' to sync and discover funds."
@@ -108,15 +118,23 @@ pub fn resync() -> Result {
 
     sync(&mut wallet_data)?;
 
-    let balance = wallet_data.get_balance();
-    let address = keys::get_default_address(&wallet_data.extfvk)?;
+    let private_balance = wallet_data.get_balance();
+    let public_balance = wallet_data.get_transparent_balance();
+    let shield_address = keys::get_default_address(&wallet_data.extfvk)?;
+    let transparent_address = wallet_data.get_transparent_address()?;
 
     Ok(json!({
         "status": "resynced",
-        "address": address,
-        "balance_sat": balance,
-        "balance": balance as f64 / 1e8,
+        "shield_address": shield_address,
+        "transparent_address": transparent_address,
+        "private_balance_sat": private_balance,
+        "private_balance": private_balance as f64 / 1e8,
+        "public_balance_sat": public_balance,
+        "public_balance": public_balance as f64 / 1e8,
+        "total_balance_sat": private_balance + public_balance,
+        "total_balance": (private_balance + public_balance) as f64 / 1e8,
         "unspent_notes": wallet_data.unspent_notes.len(),
+        "unspent_utxos": wallet_data.unspent_utxos.len(),
         "synced_to_block": wallet_data.last_block
     }))
 }
@@ -147,10 +165,12 @@ If you understand and accept these conditions, call export with confirm=true"#.i
 
 pub fn address() -> Result {
     let wallet_data = wallet::load_wallet()?;
-    let address = keys::get_default_address(&wallet_data.extfvk)?;
+    let shield_address = keys::get_default_address(&wallet_data.extfvk)?;
+    let transparent_address = wallet_data.get_transparent_address()?;
 
     Ok(json!({
-        "address": address
+        "shield_address": shield_address,
+        "transparent_address": transparent_address
     }))
 }
 
@@ -159,8 +179,10 @@ pub fn balance() -> Result {
 
     sync(&mut wallet_data)?;
 
-    let balance = wallet_data.get_balance();
-    let address = keys::get_default_address(&wallet_data.extfvk)?;
+    let private_balance = wallet_data.get_balance();
+    let public_balance = wallet_data.get_transparent_balance();
+    let shield_address = keys::get_default_address(&wallet_data.extfvk)?;
+    let transparent_address = wallet_data.get_transparent_address()?;
 
     let messages: Vec<serde_json::Value> = wallet_data
         .unspent_notes
@@ -179,10 +201,16 @@ pub fn balance() -> Result {
         .collect();
 
     let mut result = json!({
-        "address": address,
-        "balance_sat": balance,
-        "balance": balance as f64 / 1e8,
+        "shield_address": shield_address,
+        "transparent_address": transparent_address,
+        "private_balance_sat": private_balance,
+        "private_balance": private_balance as f64 / 1e8,
+        "public_balance_sat": public_balance,
+        "public_balance": public_balance as f64 / 1e8,
+        "total_balance_sat": private_balance + public_balance,
+        "total_balance": (private_balance + public_balance) as f64 / 1e8,
         "unspent_notes": wallet_data.unspent_notes.len(),
+        "unspent_utxos": wallet_data.unspent_utxos.len(),
         "synced_to_block": wallet_data.last_block
     });
 
@@ -193,35 +221,69 @@ pub fn balance() -> Result {
     Ok(result)
 }
 
-pub fn send(address: &str, amount_sat: u64, memo: &str) -> Result {
+/// Send PIV from the specified balance (private or public).
+/// `from`: "private" (shield) or "public" (transparent)
+pub fn send(address: &str, amount_sat: u64, memo: &str, from: &str) -> Result {
     let mut wallet_data = wallet::load_wallet()?;
 
     sync(&mut wallet_data)?;
 
     let net = network::PivxNetwork::new();
 
-    prover::ensure_prover_loaded()?;
+    match from {
+        "private" => {
+            // Existing shield send
+            prover::ensure_prover_loaded()?;
+            let block_count = net.get_block_count()?;
 
-    let block_count = net.get_block_count()?;
+            let result = shield::create_shield_transaction(
+                &mut wallet_data,
+                address,
+                amount_sat,
+                memo,
+                block_count + 1,
+            )?;
 
-    let result = shield::create_shield_transaction(
-        &mut wallet_data,
-        address,
-        amount_sat,
-        memo,
-        block_count + 1,
-    )?;
+            let txid = net.send_transaction(&result.txhex)?;
 
-    let txid = net.send_transaction(&result.txhex)?;
+            wallet_data.finalize_transaction(&result.nullifiers);
+            wallet::save_wallet(&wallet_data)?;
 
-    wallet_data.finalize_transaction(&result.nullifiers);
-    wallet::save_wallet(&wallet_data)?;
+            Ok(json!({
+                "status": "sent",
+                "from": "private",
+                "txid": txid,
+                "amount": result.amount as f64 / 1e8,
+                "fee": result.fee as f64 / 1e8,
+                "address": address
+            }))
+        }
+        "public" => {
+            let bip39_seed = wallet_data.get_bip39_seed();
 
-    Ok(json!({
-        "status": "sent",
-        "txid": txid,
-        "amount": result.amount as f64 / 1e8,
-        "fee": result.fee as f64 / 1e8,
-        "address": address
-    }))
+            let result = shield::create_raw_transparent_transaction(
+                &mut wallet_data,
+                &bip39_seed,
+                address,
+                amount_sat,
+            )?;
+
+            let txid = net.send_transaction(&result.txhex)?;
+
+            wallet_data.finalize_transparent_send(&result.spent);
+            wallet::save_wallet(&wallet_data)?;
+
+            Ok(json!({
+                "status": "sent",
+                "from": "public",
+                "txid": txid,
+                "amount": result.amount as f64 / 1e8,
+                "fee": result.fee as f64 / 1e8,
+                "address": address
+            }))
+        }
+        _ => {
+            Err("Invalid 'from' parameter. Must be 'private' or 'public'.".into())
+        }
+    }
 }

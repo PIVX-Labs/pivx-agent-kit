@@ -1,6 +1,6 @@
 [package]
 name = "pivx-agent-kit"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "PIVX Agent Kit – CLI toolbox for AI agents to interact with the PIVX blockchain"
 repository = "https://github.com/PIVX-Labs/pivx-agent-kit"
@@ -39,6 +39,9 @@ zeroize = { version = "1.8", features = ["derive"] }
 # System
 dirs = "5"
 machine-uid = "0.5"
+bip32 = "0.5"
+ripemd = "0.1"
+bs58 = "0.5.1"
 
 [patch.crates-io]
 orchard = { git = "https://github.com/zcash/orchard.git", rev = "c684e9185a0449efb00428f807d3bf286b5dae03" }

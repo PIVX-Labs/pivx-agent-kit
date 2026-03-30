@@ -8,6 +8,11 @@ use ::sapling::PaymentAddress;
 use std::error::Error;
 use zcash_keys::encoding;
 
+// BIP32 transparent key derivation
+use bip32::{ChildNumber, DerivationPath, XPrv};
+use sha2::{Sha256, Digest};
+use ripemd::Ripemd160;
+
 /// Shield or transparent address
 pub enum GenericAddress {
     Shield(PaymentAddress),
@@ -77,6 +82,72 @@ pub fn encode_payment_address(addr: &PaymentAddress) -> String {
         MAIN_NETWORK.hrp_sapling_payment_address(),
         addr,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Transparent key derivation (BIP32/BIP44)
+// ---------------------------------------------------------------------------
+
+/// PIVX transparent address prefix (pubkey hash → D... addresses)
+const PIVX_PUBKEY_PREFIX: u8 = 30;
+
+/// Derive a transparent PIVX address from a BIP39 seed (64 bytes).
+/// Path: m/44'/119'/0'/change/index
+/// Returns (base58 address, compressed pubkey 33 bytes, private key 32 bytes)
+pub fn transparent_key_from_bip39_seed(
+    bip39_seed: &[u8],
+    change: u32,
+    index: u32,
+) -> Result<(String, Vec<u8>, Vec<u8>), Box<dyn Error>> {
+    // BIP44 path: m/44'/119'/0'/change/index
+    let path: DerivationPath = format!("m/44'/119'/0'/{}/{}", change, index)
+        .parse()
+        .map_err(|e| format!("Invalid derivation path: {e}"))?;
+
+    // Derive extended private key from seed directly at path
+    let child = XPrv::derive_from_path(bip39_seed, &path)
+        .map_err(|e| format!("BIP32 derivation failed: {e}"))?;
+
+    // Get compressed public key (33 bytes)
+    let pubkey = child.public_key();
+    let pubkey_bytes = pubkey.to_bytes();
+
+    // Get private key bytes (32 bytes)
+    let privkey_bytes = child.to_bytes().to_vec();
+
+    // Derive address: SHA256 → RIPEMD160 → Base58Check
+    let address = pubkey_to_pivx_address(&pubkey_bytes);
+
+    Ok((address, pubkey_bytes.to_vec(), privkey_bytes))
+}
+
+/// Get the default transparent address from a mnemonic string.
+/// Derives at path m/44'/119'/0'/0/0
+pub fn get_transparent_address(mnemonic: &str) -> Result<String, Box<dyn Error>> {
+    let mnemonic_parsed = bip39::Mnemonic::parse_normalized(mnemonic)
+        .map_err(|e| format!("Invalid mnemonic: {e}"))?;
+    let bip39_seed = mnemonic_parsed.to_seed("");
+    let (address, _, _) = transparent_key_from_bip39_seed(&bip39_seed, 0, 0)?;
+    Ok(address)
+}
+
+/// Convert a compressed public key to a PIVX transparent address (D...)
+fn pubkey_to_pivx_address(pubkey: &[u8]) -> String {
+    // SHA256(pubkey)
+    let sha_hash = Sha256::digest(pubkey);
+    // RIPEMD160(SHA256(pubkey))
+    let pkh = Ripemd160::digest(sha_hash);
+
+    // Base58Check: [prefix][20-byte hash][4-byte checksum]
+    let mut payload = Vec::with_capacity(25);
+    payload.push(PIVX_PUBKEY_PREFIX);
+    payload.extend_from_slice(&pkh);
+
+    // Double SHA256 checksum
+    let checksum = Sha256::digest(Sha256::digest(&payload));
+    payload.extend_from_slice(&checksum[..4]);
+
+    bs58::encode(&payload).into_string()
 }
 
 pub fn decode_generic_address(address: &str) -> Result<GenericAddress, Box<dyn Error>> {

@@ -46,6 +46,20 @@ pub struct WalletData {
     pub unspent_notes: Vec<SerializedNote>,
     /// BIP39 mnemonic, device-encrypted on disk (NEVER output via CLI)
     mnemonic: String,
+    /// Transparent UTXOs
+    #[serde(default)]
+    #[zeroize(skip)]
+    pub unspent_utxos: Vec<SerializedUTXO>,
+}
+
+/// A transparent unspent transaction output
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SerializedUTXO {
+    pub txid: String,
+    pub vout: u32,
+    pub amount: u64,
+    pub script: String,
+    pub height: u32,
 }
 
 impl WalletData {
@@ -78,6 +92,31 @@ impl WalletData {
     pub fn finalize_transaction(&mut self, spent_nullifiers: &[String]) {
         self.unspent_notes
             .retain(|n| !spent_nullifiers.contains(&n.nullifier));
+    }
+
+    /// Sum of all transparent UTXO values in satoshis
+    #[inline]
+    pub fn get_transparent_balance(&self) -> u64 {
+        self.unspent_utxos.iter().map(|u| u.amount).sum()
+    }
+
+    /// Get the transparent address (derived from mnemonic)
+    pub fn get_transparent_address(&self) -> Result<String, Box<dyn Error>> {
+        keys::get_transparent_address(&self.mnemonic)
+    }
+
+    /// Get the full BIP39 seed for transparent key derivation
+    pub fn get_bip39_seed(&self) -> Vec<u8> {
+        let mnemonic = bip39::Mnemonic::parse_normalized(&self.mnemonic)
+            .expect("Stored mnemonic should always be valid");
+        mnemonic.to_seed("").to_vec()
+    }
+
+    /// Remove spent UTXOs after transparent send
+    pub fn finalize_transparent_send(&mut self, spent: &[(String, u32)]) {
+        self.unspent_utxos.retain(|u| {
+            !spent.iter().any(|(txid, vout)| u.txid == *txid && u.vout == *vout)
+        });
     }
 }
 
@@ -230,6 +269,7 @@ fn create_wallet_from_mnemonic(mnemonic_str: &str) -> Result<WalletData, Box<dyn
         commitment_tree: commitment_tree.to_string(),
         unspent_notes: vec![],
         mnemonic: mnemonic_str.to_string(),
+        unspent_utxos: vec![],
     })
 }
 
@@ -246,6 +286,7 @@ pub fn reset_to_checkpoint(data: &mut WalletData) -> Result<(), Box<dyn Error>> 
     data.last_block = checkpoint_height;
     data.commitment_tree = commitment_tree.to_string();
     data.unspent_notes.clear();
+    data.unspent_utxos.clear();
     Ok(())
 }
 
@@ -269,6 +310,7 @@ pub fn save_wallet(data: &WalletData) -> Result<(), Box<dyn Error>> {
         commitment_tree: data.commitment_tree.clone(),
         unspent_notes: data.unspent_notes.clone(),
         mnemonic: data.mnemonic.clone(),
+        unspent_utxos: data.unspent_utxos.clone(),
     };
     encrypt_secrets(&mut disk_data)?;
 

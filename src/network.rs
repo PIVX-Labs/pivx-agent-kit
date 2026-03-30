@@ -83,6 +83,23 @@ impl PivxNetwork {
         Err(last_err.into())
     }
 
+    /// Fetch confirmed UTXOs for a transparent address via Blockbook API
+    pub fn get_utxos(&self, address: &str) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
+        let mut last_err = String::from("No explorers configured");
+        for explorer in self.explorers {
+            let url = format!("{}/api/v2/utxo/{}?confirmed=true", explorer, address);
+            match ureq::get(&url).timeout(REQUEST_TIMEOUT).call() {
+                Ok(resp) => {
+                    let body = resp.into_string()?;
+                    let utxos: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+                    return Ok(utxos);
+                }
+                Err(e) => last_err = e.to_string(),
+            }
+        }
+        Err(last_err.into())
+    }
+
     /// Broadcast a raw transaction hex
     pub fn send_transaction(&self, tx_hex: &str) -> Result<String, Box<dyn Error>> {
         let mut last_err = String::from("Failed to broadcast");
@@ -94,6 +111,10 @@ impl PivxNetwork {
                 Ok(resp) => {
                     let body_str = resp.into_string()?;
                     let body: serde_json::Value = serde_json::from_str(&body_str)?;
+                    if let Some(err) = body.get("error").and_then(|e| e.as_str()) {
+                        last_err = err.to_string();
+                        continue;
+                    }
                     if let Some(result) =
                         body.get("result").and_then(|r: &serde_json::Value| r.as_str())
                     {
@@ -102,18 +123,36 @@ impl PivxNetwork {
                     // HTTP 200 but unexpected body — tx likely accepted, return raw
                     return Ok(body_str);
                 }
+                Err(ureq::Error::Status(_, resp)) => {
+                    // Non-2xx — read the error body
+                    last_err = resp.into_string().unwrap_or_else(|_| "Unknown error".into());
+                }
                 Err(e) => last_err = e.to_string(),
             }
         }
 
-        // Fallback to RPC only if ALL explorers failed to connect
-        let resp = self.rpc_get(&format!("/sendrawtransaction?params={}", tx_hex))?;
-        let result: serde_json::Value = serde_json::from_str(&resp)?;
-        result
-            .get("result")
-            .and_then(|r| r.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| format!("Broadcast failed: {}", last_err).into())
+        // Fallback to RPC (POST for large payloads)
+        let mut rpc_err = String::new();
+        for node in self.rpc_nodes {
+            let url = format!("{}/sendrawtransaction", node);
+            let body = serde_json::json!({ "params": [tx_hex] }).to_string();
+            match ureq::post(&url)
+                .timeout(REQUEST_TIMEOUT)
+                .set("Content-Type", "application/json")
+                .send_string(&body)
+            {
+                Ok(resp) => {
+                    let body_str = resp.into_string()?;
+                    let parsed: serde_json::Value = serde_json::from_str(&body_str)?;
+                    if let Some(result) = parsed.get("result").and_then(|r| r.as_str()) {
+                        return Ok(result.to_string());
+                    }
+                    return Ok(body_str);
+                }
+                Err(e) => rpc_err = e.to_string(),
+            }
+        }
+        Err(format!("Broadcast failed — explorers: {}, RPC: {}", last_err, rpc_err).into())
     }
 }
 

@@ -33,7 +33,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "pivx_address",
-            "description": "Get the wallet's shield receiving address.",
+            "description": "Get the wallet's shield (private) and transparent (public) receiving addresses.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -42,7 +42,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "pivx_balance",
-            "description": "Sync with the network and return the current wallet balance. Also returns any memos attached to received funds in the 'messages' field.",
+            "description": "Sync with the network and return both private (shield) and public (transparent) balances. Also returns any memos attached to received shield funds in the 'messages' field.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -51,24 +51,28 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "pivx_send",
-            "description": "Send PIV to a shield or transparent address. Auto-syncs before sending. Returns the transaction ID, actual amount sent, and fee.",
+            "description": "Send PIV to a shield or transparent address. Specify 'from' to choose which balance to spend from. Auto-syncs before sending.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "address": {
                         "type": "string",
-                        "description": "Destination PIVX address (shield addresses start with 'ps1')"
+                        "description": "Destination PIVX address (shield 'ps1...' or transparent 'D...')"
                     },
                     "amount": {
                         "type": "string",
-                        "description": "Amount in PIV as a decimal string (e.g. '10.5'). Parsed with exact integer precision."
+                        "description": "Amount in PIV as a decimal string (e.g. '10.5')"
+                    },
+                    "from": {
+                        "type": "string",
+                        "description": "Which balance to spend from: 'private' (shield) or 'public' (transparent). Required."
                     },
                     "memo": {
                         "type": "string",
-                        "description": "Optional encrypted memo (up to 512 bytes UTF-8, shield-to-shield only)"
+                        "description": "Optional encrypted memo (up to 512 bytes UTF-8, private-to-private only)"
                     }
                 },
-                "required": ["address", "amount"]
+                "required": ["address", "amount", "from"]
             }
         },
         {
@@ -202,11 +206,16 @@ fn dispatch_tool(name: &str, args: &Value) -> core::Result {
                 .and_then(|m| m.as_str())
                 .unwrap_or("");
 
+            let from = args
+                .get("from")
+                .and_then(|f| f.as_str())
+                .ok_or("Missing 'from' argument. Must be 'private' or 'public'.")?;
+
             let amount_sat = core::parse_piv_to_sat(amount_str)?;
             if amount_sat == 0 {
                 return Err("Amount must be greater than zero".into());
             }
-            core::send(address, amount_sat, memo)
+            core::send(address, amount_sat, memo, from)
         }
 
         "pivx_resync" => core::resync(),

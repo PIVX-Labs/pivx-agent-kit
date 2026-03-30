@@ -24,15 +24,16 @@ PIVX Agent Kit v{} – CLI toolbox for AI agents to interact with the PIVX block
 Usage: pivx-agent-kit <command> [args]
 
 Commands:
-  init                              Create a new shielded wallet
-  import <mnemonic>                 Import wallet from seed phrase
-  address                           Show the shield receiving address
-  balance                           Sync and show wallet balance
-  send <address> <amount> [memo]    Send PIV to an address
-  resync                            Reset and re-sync shield data from checkpoint
-  export                            Export wallet seed phrase for migration
-  serve                             Run as MCP server (for AI agent integration)
-  update                            Update to the latest release", VERSION)
+  init                                          Create a new wallet (shield + transparent)
+  import <mnemonic>                             Import wallet from seed phrase
+  address                                       Show shield and transparent addresses
+  balance                                       Sync and show private + public balances
+  send <address> <amount> --from <private|public> [memo]
+                                                Send PIV from private or public balance
+  resync                                        Reset and re-sync from checkpoint
+  export                                        Export wallet seed phrase for migration
+  serve                                         Run as MCP server (for AI agent integration)
+  update                                        Update to the latest release", VERSION)
 }
 
 fn main() {
@@ -64,14 +65,29 @@ fn main() {
         Some("send") => {
             let addr = args.get(1).map(|s| s.as_str());
             let amount_str = args.get(2).map(|s| s.as_str());
-            let memo = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            // Parse --from flag and memo from remaining args
+            let mut from = "private";
+            let mut memo = "";
+            let mut i = 3;
+            while i < args.len() {
+                if args[i] == "--from" {
+                    if let Some(f) = args.get(i + 1) {
+                        from = if f == "public" { "public" } else { "private" };
+                        i += 2;
+                        continue;
+                    }
+                } else if memo.is_empty() {
+                    memo = &args[i];
+                }
+                i += 1;
+            }
             match (addr, amount_str) {
                 (Some(a), Some(amt)) => match core::parse_piv_to_sat(amt) {
                     Ok(sat) if sat == 0 => Err("Amount must be greater than zero".into()),
-                    Ok(sat) => core::send(a, sat, memo),
+                    Ok(sat) => core::send(a, sat, memo, from),
                     Err(e) => Err(e.into()),
                 },
-                _ => Err("Usage: pivx-agent-kit send <address> <amount> [memo]".into()),
+                _ => Err("Usage: pivx-agent-kit send <address> <amount> --from <private|public> [memo]".into()),
             }
         }
         _ => {

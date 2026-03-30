@@ -251,9 +251,9 @@ fn fee_calculator(
     fee_per_byte
         * (sapling_output_count * 948
             + sapling_input_count * 384
-            + transparent_input_count * 150
+            + transparent_input_count * 180
             + transparent_output_count * 34
-            + 85)
+            + 100)
 }
 
 pub struct TransactionResult {
@@ -415,4 +415,469 @@ pub fn create_shield_transaction(
         amount,
         fee,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Transparent transaction building
+// ---------------------------------------------------------------------------
+
+use zcash_transparent::bundle::OutPoint;
+
+/// Build and sign a transparent transaction spending UTXOs.
+pub fn create_transparent_transaction(
+    wallet: &mut WalletData,
+    bip39_seed: &[u8],
+    to_address: &str,
+    amount: u64,
+    block_height: u32,
+) -> Result<TransparentTransactionResult, Box<dyn Error>> {
+    let network = MAIN_NETWORK;
+
+    // Derive transparent private key at m/44'/119'/0'/0/0
+    let (own_address, pubkey_bytes, privkey_bytes) =
+        keys::transparent_key_from_bip39_seed(bip39_seed, 0, 0)?;
+
+    // Build secp256k1 key pair (v0.29 — matches librustpivx)
+    let secp = secp256k1::Secp256k1::new();
+    let sk = secp256k1::SecretKey::from_slice(&privkey_bytes)
+        .map_err(|e| format!("Invalid private key: {e}"))?;
+    let pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
+
+    // Get the P2PKH script for our own address
+    let own_transparent = keys::decode_generic_address(&own_address)?;
+    let own_script = match &own_transparent {
+        GenericAddress::Transparent(addr) => addr.script(),
+        _ => return Err("Own address is not transparent".into()),
+    };
+
+    // Sort UTXOs by amount descending (spend large ones first)
+    let mut utxos = wallet.unspent_utxos.clone();
+    utxos.sort_by(|a, b| b.amount.cmp(&a.amount));
+
+    if utxos.is_empty() {
+        return Err("No transparent UTXOs available".into());
+    }
+
+    // Destination
+    let to = keys::decode_generic_address(to_address)?;
+    let is_shield_dest = matches!(to, GenericAddress::Shield(_));
+
+    // Calculate output counts for fee estimation
+    let transparent_output_count: u64 = if is_shield_dest { 0 } else { 2 }; // dest + change
+    let sapling_output_count: u64 = if is_shield_dest { 2 } else { 0 }; // dest + change (shield)
+
+    // Select UTXOs
+    let mut selected: Vec<crate::wallet::SerializedUTXO> = Vec::new();
+    let mut total: u64 = 0;
+    let mut fee: u64 = 0;
+
+    for utxo in &utxos {
+        selected.push(utxo.clone());
+        total += utxo.amount;
+
+        fee = fee_calculator(
+            selected.len() as u64,
+            transparent_output_count,
+            0, // no sapling inputs
+            sapling_output_count,
+        );
+
+        if total >= amount + fee {
+            break;
+        }
+    }
+
+    if total < amount + fee {
+        return Err(format!(
+            "Insufficient public balance. Have: {} sat, need: {} sat (amount) + {} sat (fee)",
+            total, amount, fee
+        ).into());
+    }
+
+    let change = total - amount - fee;
+
+    // Build transaction — need sapling anchor if destination is shielded
+    let sapling_anchor = if is_shield_dest {
+        // Get anchor from wallet's commitment tree
+        if !wallet.commitment_tree.is_empty() && wallet.commitment_tree != "00" {
+            let tree: CommitmentTree<Node, DEPTH> = read_commitment_tree(Cursor::new(
+                crate::simd::hex::hex_string_to_bytes(&wallet.commitment_tree),
+            ))?;
+            Some(Anchor::from_bytes(tree.root().to_bytes())
+                .into_option()
+                .unwrap_or(Anchor::empty_tree()))
+        } else {
+            Some(Anchor::empty_tree())
+        }
+    } else {
+        None
+    };
+
+    let mut builder = Builder::new(
+        network,
+        BlockHeight::from_u32(block_height),
+        BuildConfig::Standard {
+            sapling_anchor,
+            orchard_anchor: None,
+        },
+    );
+
+    let mut signing_set = TransparentSigningSet::new();
+    let builder_pk = signing_set.add_key(sk);
+
+    // Add inputs
+    for utxo in &selected {
+        let mut txid_bytes = crate::simd::hex::hex_string_to_bytes(&utxo.txid);
+        txid_bytes.reverse(); // txid is displayed in reverse byte order
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&txid_bytes);
+        let outpoint = OutPoint::new(hash, utxo.vout);
+
+        let txout = zcash_transparent::bundle::TxOut {
+            value: pivx_primitives::transaction::components::amount::NonNegativeAmount::from_u64(utxo.amount)
+                .map_err(|_| "Invalid amount")?,
+            script_pubkey: own_script.clone(),
+        };
+
+        builder.add_transparent_input(builder_pk, outpoint, txout)
+            .map_err(|e| format!("Failed to add transparent input: {:?}", e))?;
+    }
+
+    // Add output
+    let send_amount = Zatoshis::from_u64(amount).map_err(|_| "Invalid amount")?;
+    match to {
+        GenericAddress::Transparent(addr) => {
+            builder.add_transparent_output(&addr, send_amount)
+                .map_err(|e| format!("Failed to add output: {:?}", e))?;
+        }
+        GenericAddress::Shield(addr) => {
+            // Transparent → Shield requires sapling prover
+            crate::prover::ensure_prover_loaded()?;
+            builder.add_sapling_output::<FeeRule>(None, addr, send_amount, MemoBytes::empty())
+                .map_err(|_| "Failed to add shield output")?;
+        }
+    }
+
+    // Add change (back to own transparent address)
+    if change > 0 {
+        let change_amount = Zatoshis::from_u64(change).map_err(|_| "Invalid change")?;
+        if let GenericAddress::Transparent(addr) = &own_transparent {
+            builder.add_transparent_output(addr, change_amount)
+                .map_err(|e| format!("Failed to add change: {:?}", e))?;
+        }
+    }
+
+    // Build and sign
+    let prover = if is_shield_dest {
+        let p = prover::get_prover()?;
+        Some(p)
+    } else {
+        None
+    };
+
+    let (output_prover, spend_prover) = match &prover {
+        Some((o, s)) => (o, s),
+        None => {
+            // Dummy provers for transparent-only tx
+            // We need references but they won't actually be used
+            // Use ensure_prover_loaded and get_prover for safety
+            crate::prover::ensure_prover_loaded()?;
+            let p = prover::get_prover()?;
+            // Leak is safe here — provers are static-lifetime cached
+            let leaked = Box::leak(Box::new(p));
+            (&leaked.0, &leaked.1)
+        }
+    };
+
+    let fee_rule = FeeRule::non_standard(
+        Zatoshis::from_u64(fee).map_err(|_| "Invalid fee")?
+    );
+    let result = builder.build(
+        &signing_set,
+        &[], // no sapling spending keys
+        &[], // no orchard spending keys
+        OsRng,
+        spend_prover,
+        output_prover,
+        &fee_rule,
+    )?;
+
+    let mut tx_hex = vec![];
+    result.transaction().write(&mut tx_hex)?;
+
+    // Collect spent UTXO identifiers
+    let spent: Vec<(String, u32)> = selected.iter()
+        .map(|u| (u.txid.clone(), u.vout))
+        .collect();
+
+    Ok(TransparentTransactionResult {
+        txhex: crate::simd::hex::bytes_to_hex_string(&tx_hex),
+        spent,
+        amount,
+        fee,
+    })
+}
+
+pub struct TransparentTransactionResult {
+    pub txhex: String,
+    pub spent: Vec<(String, u32)>,
+    pub amount: u64,
+    pub fee: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Raw v1 transparent transaction builder (bypasses librustpivx builder)
+// ---------------------------------------------------------------------------
+
+/// Build a raw v1 transparent transaction, signed with secp256k1.
+/// This avoids the v3/Sapling format that PIVX nodes reject for pure transparent txs.
+pub fn create_raw_transparent_transaction(
+    wallet: &mut WalletData,
+    bip39_seed: &[u8],
+    to_address: &str,
+    amount: u64,
+) -> Result<TransparentTransactionResult, Box<dyn Error>> {
+    // Shield destination → use the v3 builder (supports sapling outputs with transparent inputs)
+    if to_address.starts_with(MAIN_NETWORK.hrp_sapling_payment_address()) {
+        return create_transparent_transaction(wallet, bip39_seed, to_address, amount,
+            crate::network::PivxNetwork::new().get_block_count()? + 1);
+    }
+
+    // Derive transparent key at m/44'/119'/0'/0/0
+    let (own_address, pubkey_bytes, privkey_bytes) =
+        keys::transparent_key_from_bip39_seed(bip39_seed, 0, 0)?;
+
+    // Build the destination scriptPubKey
+    let to_script = address_to_p2pkh_script(to_address)?;
+    let own_script = address_to_p2pkh_script(&own_address)?;
+
+    // Sort UTXOs by amount descending
+    let mut utxos = wallet.unspent_utxos.clone();
+    utxos.sort_by(|a, b| b.amount.cmp(&a.amount));
+    if utxos.is_empty() {
+        return Err("No transparent UTXOs available".into());
+    }
+
+    // Select UTXOs
+    let mut selected: Vec<crate::wallet::SerializedUTXO> = Vec::new();
+    let mut total: u64 = 0;
+
+    for utxo in &utxos {
+        selected.push(utxo.clone());
+        total += utxo.amount;
+
+        // Estimate fee: 10 sat/byte, ~150 bytes per input + ~34 per output + ~10 overhead
+        let est_size = selected.len() * 150 + 2 * 34 + 10;
+        let fee = (est_size as u64) * 10;
+
+        if total >= amount + fee {
+            break;
+        }
+    }
+
+    // Final fee calculation
+    let est_size = selected.len() * 150 + 2 * 34 + 10;
+    let fee = (est_size as u64) * 10;
+
+    if total < amount + fee {
+        return Err(format!(
+            "Insufficient public balance. Have: {} sat, need: {} sat + {} sat fee",
+            total, amount, fee
+        ).into());
+    }
+
+    let change = total - amount - fee;
+
+    // Build unsigned transaction
+    let secp = secp256k1::Secp256k1::new();
+    let sk = secp256k1::SecretKey::from_slice(&privkey_bytes)
+        .map_err(|e| format!("Invalid private key: {e}"))?;
+
+    // --- Construct raw transaction bytes ---
+    let mut tx = Vec::new();
+
+    // Version (1)
+    tx.extend_from_slice(&1u32.to_le_bytes());
+
+    // Input count
+    write_varint(&mut tx, selected.len() as u64);
+
+    // Inputs (unsigned — scriptSig will be filled after signing)
+    for utxo in &selected {
+        let mut txid_bytes = crate::simd::hex::hex_string_to_bytes(&utxo.txid);
+        txid_bytes.reverse(); // Internal byte order
+        tx.extend_from_slice(&txid_bytes);
+        tx.extend_from_slice(&utxo.vout.to_le_bytes());
+        // Placeholder scriptSig (will be replaced per-input during signing)
+        tx.push(0x00); // scriptSig length = 0
+        tx.extend_from_slice(&0xffffffffu32.to_le_bytes()); // sequence
+    }
+
+    // Output count
+    let output_count = if change > 0 { 2u64 } else { 1u64 };
+    write_varint(&mut tx, output_count);
+
+    // Output 1: destination
+    tx.extend_from_slice(&amount.to_le_bytes());
+    write_varint(&mut tx, to_script.len() as u64);
+    tx.extend_from_slice(&to_script);
+
+    // Output 2: change (if any)
+    if change > 0 {
+        tx.extend_from_slice(&change.to_le_bytes());
+        write_varint(&mut tx, own_script.len() as u64);
+        tx.extend_from_slice(&own_script);
+    }
+
+    // Locktime
+    tx.extend_from_slice(&0u32.to_le_bytes());
+
+    // --- Sign each input (SIGHASH_ALL) ---
+    let mut signed_tx = Vec::new();
+    signed_tx.extend_from_slice(&1u32.to_le_bytes()); // version
+    write_varint(&mut signed_tx, selected.len() as u64);
+
+    for (input_idx, utxo) in selected.iter().enumerate() {
+        let mut txid_bytes = crate::simd::hex::hex_string_to_bytes(&utxo.txid);
+        txid_bytes.reverse();
+        signed_tx.extend_from_slice(&txid_bytes);
+        signed_tx.extend_from_slice(&utxo.vout.to_le_bytes());
+
+        // Build sighash: serialize tx with THIS input's scriptPubKey and others blanked
+        let sighash = compute_sighash(&selected, &own_script, input_idx, amount, change, &to_script);
+
+        // Sign with ECDSA
+        let msg = secp256k1::Message::from_digest(sighash);
+        let sig = secp.sign_ecdsa(&msg, &sk);
+        let mut sig_bytes = sig.serialize_der().to_vec();
+        sig_bytes.push(0x01); // SIGHASH_ALL
+
+        // ScriptSig: [sig_len][signature][pubkey_len][pubkey]
+        let script_sig_len = sig_bytes.len() + pubkey_bytes.len() + 2;
+        write_varint(&mut signed_tx, script_sig_len as u64);
+        signed_tx.push(sig_bytes.len() as u8);
+        signed_tx.extend_from_slice(&sig_bytes);
+        signed_tx.push(pubkey_bytes.len() as u8);
+        signed_tx.extend_from_slice(&pubkey_bytes);
+
+        signed_tx.extend_from_slice(&0xffffffffu32.to_le_bytes());
+    }
+
+    // Outputs
+    write_varint(&mut signed_tx, output_count);
+    signed_tx.extend_from_slice(&amount.to_le_bytes());
+    write_varint(&mut signed_tx, to_script.len() as u64);
+    signed_tx.extend_from_slice(&to_script);
+    if change > 0 {
+        signed_tx.extend_from_slice(&change.to_le_bytes());
+        write_varint(&mut signed_tx, own_script.len() as u64);
+        signed_tx.extend_from_slice(&own_script);
+    }
+
+    // Locktime
+    signed_tx.extend_from_slice(&0u32.to_le_bytes());
+
+    let spent: Vec<(String, u32)> = selected.iter()
+        .map(|u| (u.txid.clone(), u.vout))
+        .collect();
+
+    Ok(TransparentTransactionResult {
+        txhex: crate::simd::hex::bytes_to_hex_string(&signed_tx),
+        spent,
+        amount,
+        fee,
+    })
+}
+
+/// Decode a PIVX transparent address to its P2PKH scriptPubKey
+fn address_to_p2pkh_script(address: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    let decoded = bs58::decode(address).into_vec()
+        .map_err(|e| format!("Invalid base58 address: {e}"))?;
+    if decoded.len() != 25 {
+        return Err("Invalid address length".into());
+    }
+    // decoded: [prefix_byte][20-byte-hash][4-byte-checksum]
+    let pkh = &decoded[1..21];
+    // P2PKH: OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG
+    let mut script = vec![0x76, 0xa9, 0x14];
+    script.extend_from_slice(pkh);
+    script.push(0x88); // OP_EQUALVERIFY
+    script.push(0xac); // OP_CHECKSIG
+    Ok(script)
+}
+
+/// Compute SIGHASH_ALL for a specific input
+fn compute_sighash(
+    inputs: &[crate::wallet::SerializedUTXO],
+    own_script: &[u8],
+    signing_index: usize,
+    amount: u64,
+    change: u64,
+    to_script: &[u8],
+) -> [u8; 32] {
+    let mut preimage = Vec::new();
+
+    // Version
+    preimage.extend_from_slice(&1u32.to_le_bytes());
+
+    // Inputs
+    write_varint(&mut preimage, inputs.len() as u64);
+    for (i, utxo) in inputs.iter().enumerate() {
+        let mut txid_bytes = crate::simd::hex::hex_string_to_bytes(&utxo.txid);
+        txid_bytes.reverse();
+        preimage.extend_from_slice(&txid_bytes);
+        preimage.extend_from_slice(&utxo.vout.to_le_bytes());
+
+        if i == signing_index {
+            // This input gets the scriptPubKey
+            write_varint(&mut preimage, own_script.len() as u64);
+            preimage.extend_from_slice(own_script);
+        } else {
+            // Other inputs get empty script
+            preimage.push(0x00);
+        }
+        preimage.extend_from_slice(&0xffffffffu32.to_le_bytes());
+    }
+
+    // Outputs
+    let output_count = if change > 0 { 2u64 } else { 1u64 };
+    write_varint(&mut preimage, output_count);
+    preimage.extend_from_slice(&amount.to_le_bytes());
+    write_varint(&mut preimage, to_script.len() as u64);
+    preimage.extend_from_slice(to_script);
+    if change > 0 {
+        preimage.extend_from_slice(&change.to_le_bytes());
+        write_varint(&mut preimage, own_script.len() as u64);
+        preimage.extend_from_slice(own_script);
+    }
+
+    // Locktime
+    preimage.extend_from_slice(&0u32.to_le_bytes());
+
+    // SIGHASH_ALL flag
+    preimage.extend_from_slice(&1u32.to_le_bytes());
+
+    // Double SHA256
+    use sha2::{Sha256, Digest};
+    let hash1 = Sha256::digest(&preimage);
+    let hash2 = Sha256::digest(hash1);
+    let mut result = [0u8; 32];
+    result.copy_from_slice(&hash2);
+    result
+}
+
+/// Write a Bitcoin-style variable-length integer
+fn write_varint(buf: &mut Vec<u8>, val: u64) {
+    if val < 0xfd {
+        buf.push(val as u8);
+    } else if val <= 0xffff {
+        buf.push(0xfd);
+        buf.extend_from_slice(&(val as u16).to_le_bytes());
+    } else if val <= 0xffffffff {
+        buf.push(0xfe);
+        buf.extend_from_slice(&(val as u32).to_le_bytes());
+    } else {
+        buf.push(0xff);
+        buf.extend_from_slice(&val.to_le_bytes());
+    }
 }

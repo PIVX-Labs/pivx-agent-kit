@@ -184,3 +184,43 @@ fn validate_sapling_root(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Transparent UTXO sync
+// ---------------------------------------------------------------------------
+
+use crate::wallet::SerializedUTXO;
+
+/// Sync transparent UTXOs for the wallet's transparent address.
+/// Simple: fetch all confirmed UTXOs from Blockbook and replace the stored set.
+pub fn sync_transparent(wallet: &mut WalletData, net: &PivxNetwork) -> Result<(), Box<dyn Error>> {
+    let address = wallet.get_transparent_address()?;
+    let raw_utxos = net.get_utxos(&address)?;
+
+    let mut utxos = Vec::new();
+    for u in &raw_utxos {
+        let txid = u["txid"].as_str().unwrap_or_default().to_string();
+        let vout = u["vout"].as_u64().unwrap_or(0) as u32;
+        let amount = u["value"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| u["value"].as_u64())
+            .unwrap_or(0);
+        let height = u["height"].as_u64().unwrap_or(0) as u32;
+
+        if txid.is_empty() || amount == 0 {
+            continue;
+        }
+
+        utxos.push(SerializedUTXO {
+            txid,
+            vout,
+            amount,
+            script: String::new(), // Blockbook doesn't always return scripts; we derive on-the-fly
+            height,
+        });
+    }
+
+    wallet.unspent_utxos = utxos;
+    Ok(())
+}
