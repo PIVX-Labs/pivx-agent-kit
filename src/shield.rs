@@ -96,7 +96,7 @@ pub fn handle_blocks(
         read_commitment_tree(Cursor::new(crate::simd::hex::hex_string_to_bytes(tree_hex)))?;
 
     let extfvk = keys::decode_extfvk(enc_extfvk)?;
-    let key = UnifiedFullViewingKey::from_sapling_extended_full_viewing_key(extfvk)
+    let key = UnifiedFullViewingKey::from_sapling_extended_full_viewing_key(extfvk.clone())
         .map_err(|_| "Failed to create unified full viewing key")?;
 
     let mut comp_notes: Vec<SpendableNote> = existing_notes
@@ -117,15 +117,27 @@ pub fn handle_blocks(
 
     for block in blocks {
         for tx_bytes in &block.txs {
-            let tx_nullifiers = handle_transaction(
-                &mut tree,
-                tx_bytes,
-                &key_map,
-                &nullif_key,
-                &mut comp_notes,
-                &mut new_notes,
-                block.height,
-            )?;
+            let tx_nullifiers = if tx_bytes[0] == 0x04 {
+                handle_compact_transaction(
+                    &mut tree,
+                    tx_bytes,
+                    &extfvk,
+                    &nullif_key,
+                    &mut comp_notes,
+                    &mut new_notes,
+                    block.height,
+                )?
+            } else {
+                handle_transaction(
+                    &mut tree,
+                    tx_bytes,
+                    &key_map,
+                    &nullif_key,
+                    &mut comp_notes,
+                    &mut new_notes,
+                    block.height,
+                )?
+            };
             let tx_nullifier_strs: Vec<String> = tx_nullifiers
                 .iter()
                 .map(|n| crate::simd::hex::bytes_to_hex_string(&n.0))
@@ -218,6 +230,130 @@ fn handle_transaction(
     }
 
     Ok(nullifiers)
+}
+
+/// Process a compact transaction (0x04 packet) — no Transaction::read needed.
+///
+/// Packet: [0x04][nSpends:1][nOutputs:1]
+///   per spend: nullifier(32)
+///   per output: cv(32) + cmu(32) + epk(32) + enc_ciphertext(580) + out_ciphertext(80)
+#[inline]
+fn handle_compact_transaction(
+    tree: &mut CommitmentTree<Node, DEPTH>,
+    payload: &[u8],
+    extfvk: &sapling::zip32::ExtendedFullViewingKey,
+    nullif_key: &NullifierDerivingKey,
+    existing_witnesses: &mut Vec<SpendableNote>,
+    new_witnesses: &mut Vec<SpendableNote>,
+    block_height: u32,
+) -> Result<Vec<Nullifier>, Box<dyn Error>> {
+    if payload.len() < 3 {
+        return Err("compact tx too short".into());
+    }
+
+    let num_spends = payload[1] as usize;
+    let num_outputs = payload[2] as usize;
+    let mut pos = 3;
+
+    // Read nullifiers
+    let mut nullifiers = Vec::with_capacity(num_spends);
+    for _ in 0..num_spends {
+        if pos + 32 > payload.len() { return Err("truncated compact spend".into()); }
+        let mut nf = [0u8; 32];
+        nf.copy_from_slice(&payload[pos..pos + 32]);
+        nullifiers.push(Nullifier(nf));
+        pos += 32;
+    }
+
+    // Prepare decryption
+    let ivk = sapling::note_encryption::PreparedIncomingViewingKey::new(
+        &extfvk.fvk.vk.ivk(),
+    );
+
+    // Read and process outputs
+    const ENC_CT_SIZE: usize = 580;
+    const OUT_CT_SIZE: usize = 80;
+    const OUTPUT_SIZE: usize = 32 + 32 + 32 + ENC_CT_SIZE + OUT_CT_SIZE; // 756
+
+    for i in 0..num_outputs {
+        if pos + OUTPUT_SIZE > payload.len() { return Err("truncated compact output".into()); }
+
+        let cmu_bytes: [u8; 32] = payload[pos + 32..pos + 64].try_into()?;
+        let epk_bytes: [u8; 32] = payload[pos + 64..pos + 96].try_into()?;
+        let enc_ct: &[u8] = &payload[pos + 96..pos + 96 + ENC_CT_SIZE];
+
+        // Append CMU to commitment tree
+        let cmu = sapling::note::ExtractedNoteCommitment::from_bytes(&cmu_bytes)
+            .into_option()
+            .ok_or("invalid cmu")?;
+        let cmu_node = Node::from_cmu(&cmu);
+        tree.append(cmu_node)
+            .map_err(|_| "failed to append cmu to tree")?;
+
+        // Advance all witnesses
+        for w in existing_witnesses.iter_mut().chain(new_witnesses.iter_mut()) {
+            w.witness.append(cmu_node)
+                .map_err(|_| "failed to advance witness")?;
+        }
+
+        // Try IVK decryption
+        let domain = sapling::note_encryption::SaplingDomain::new(
+            sapling::note_encryption::Zip212Enforcement::Off,
+        );
+
+        // Build a CompactOutputDescription for decryption
+        let compact_output = CompactOutput {
+            cmu: cmu_bytes,
+            epk: epk_bytes,
+            enc_ciphertext: enc_ct.try_into().map_err(|_| "enc_ct wrong size")?,
+        };
+
+        if let Some((note, _recipient, memo_bytes)) =
+            zcash_note_encryption::try_note_decryption(&domain, &ivk, &compact_output)
+        {
+            let witness = IncrementalWitness::<Node, DEPTH>::from_tree(tree.clone());
+            let nullifier = get_nullifier_from_note(nullif_key, &note, &witness)?;
+            let memo = pivx_protocol::memo::Memo::from_bytes(memo_bytes.as_slice())
+                .map(|m| match m {
+                    pivx_protocol::memo::Memo::Text(t) => t.to_string(),
+                    _ => String::new(),
+                })
+                .ok();
+
+            new_witnesses.push(SpendableNote {
+                note,
+                witness,
+                nullifier,
+                memo,
+                height: block_height,
+            });
+        }
+
+        pos += OUTPUT_SIZE;
+    }
+
+    Ok(nullifiers)
+}
+
+/// Compact output struct implementing ShieldedOutput for try_note_decryption.
+struct CompactOutput {
+    cmu: [u8; 32],
+    epk: [u8; 32],
+    enc_ciphertext: [u8; 580],
+}
+
+impl zcash_note_encryption::ShieldedOutput<sapling::note_encryption::SaplingDomain, 580> for CompactOutput {
+    fn ephemeral_key(&self) -> zcash_note_encryption::EphemeralKeyBytes {
+        zcash_note_encryption::EphemeralKeyBytes(self.epk)
+    }
+
+    fn cmstar_bytes(&self) -> [u8; 32] {
+        self.cmu
+    }
+
+    fn enc_ciphertext(&self) -> &[u8; 580] {
+        &self.enc_ciphertext
+    }
 }
 
 #[inline]

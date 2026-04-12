@@ -53,18 +53,34 @@ fn parse_next_blocks(
         reader.read_exact(&mut payload)?;
 
         match payload[0] {
-            0x5d => {
-                if payload.len() < 9 {
-                    return Err(format!("Block header too short: {} bytes (need 9)", payload.len()).into());
-                }
+            0x5d if !txs.is_empty() => {
+                // PivxCompat: block footer AFTER txs (9 bytes with time)
                 let height = u32::from_le_bytes(payload[1..5].try_into()?);
                 blocks.push(RawBlock {
                     height,
                     txs: std::mem::take(&mut txs),
                 });
             }
-            0x03 => {
-                txs.push(payload);
+            0x5d => {
+                // Compact: block header BEFORE txs (5 bytes)
+                // Finalize previous compact block if it has txs
+                if let Some(last) = blocks.last() {
+                    if !last.txs.is_empty() {
+                        // Previous block is complete
+                    }
+                }
+                let height = u32::from_le_bytes(payload[1..5].try_into()?);
+                blocks.push(RawBlock { height, txs: vec![] });
+            }
+            0x03 | 0x04 => {
+                // 0x03 = full raw tx, 0x04 = compact tx
+                // In compact format, add to the current block (last in blocks vec)
+                if let Some(last) = blocks.last_mut() {
+                    last.txs.push(payload);
+                } else {
+                    // PivxCompat: txs come before footer
+                    txs.push(payload);
+                }
             }
             other => {
                 return Err(format!("Unknown packet type 0x{:02x} in shield binary stream", other).into());

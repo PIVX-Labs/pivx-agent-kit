@@ -71,7 +71,7 @@ impl PivxNetwork {
     ) -> Result<Box<dyn Read + Send>, Box<dyn Error>> {
         let mut last_err = String::from("No RPC nodes configured");
         for node in self.rpc_nodes {
-            let url = format!("{}/getshielddata?startBlock={}", node, start_block);
+            let url = format!("{}/getshielddata?startBlock={}&format=compact", node, start_block);
             let agent = ureq::AgentBuilder::new()
                 .timeout_read(STREAM_READ_TIMEOUT)
                 .build();
