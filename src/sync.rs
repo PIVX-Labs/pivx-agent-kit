@@ -1,97 +1,19 @@
-//! Binary shield data stream parser and sync orchestrator.
+//! Sync orchestrator — pairs the kit's pure block parser with network I/O.
 
 use crate::network::PivxNetwork;
-use crate::shield::{self, ShieldBlock};
 use crate::wallet::WalletData;
+use pivx_wallet_kit::sapling::sync as shield_sync;
+use pivx_wallet_kit::sapling::tree;
+use pivx_wallet_kit::sync as kit_sync;
+use pivx_wallet_kit::wallet as kit_wallet;
 use std::error::Error;
 use std::io::Read;
 
-/// Maximum packet size from the network (no single shield tx exceeds 1MB)
-const MAX_PACKET_SIZE: usize = 1_048_576;
-
-/// Save wallet every N batches during sync to preserve progress
+/// Save wallet every N batches during sync to preserve progress.
 const SAVE_INTERVAL: u32 = 10;
 
-/// Parse a 4-byte little-endian length from a reader
-#[inline]
-fn read_u32_le(reader: &mut dyn Read) -> Result<Option<u32>, Box<dyn Error>> {
-    let mut buf = [0u8; 4];
-    match reader.read_exact(&mut buf) {
-        Ok(()) => Ok(Some(u32::from_le_bytes(buf))),
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
-struct RawBlock {
-    height: u32,
-    txs: Vec<Vec<u8>>,
-}
-
-/// Parse the next batch of blocks from the binary stream.
-fn parse_next_blocks(
-    reader: &mut dyn Read,
-    max_blocks: usize,
-) -> Result<Option<Vec<RawBlock>>, Box<dyn Error>> {
-    let mut txs: Vec<Vec<u8>> = vec![];
-    let mut blocks: Vec<RawBlock> = vec![];
-
-    while blocks.len() < max_blocks {
-        let length = match read_u32_le(reader)? {
-            Some(l) => l as usize,
-            None => break,
-        };
-
-        if length > MAX_PACKET_SIZE {
-            return Err(format!("Packet too large: {} bytes (max {})", length, MAX_PACKET_SIZE).into());
-        }
-        if length == 0 {
-            return Err("Zero-length packet in shield binary stream".into());
-        }
-
-        let mut payload = vec![0u8; length];
-        reader.read_exact(&mut payload)?;
-
-        match payload[0] {
-            0x5d if !txs.is_empty() => {
-                // PivxCompat: block footer AFTER txs (9 bytes with time)
-                let height = u32::from_le_bytes(payload[1..5].try_into()?);
-                blocks.push(RawBlock {
-                    height,
-                    txs: std::mem::take(&mut txs),
-                });
-            }
-            0x5d => {
-                // Compact: block header BEFORE txs (5 bytes)
-                // Finalize previous compact block if it has txs
-                if let Some(last) = blocks.last() {
-                    if !last.txs.is_empty() {
-                        // Previous block is complete
-                    }
-                }
-                let height = u32::from_le_bytes(payload[1..5].try_into()?);
-                blocks.push(RawBlock { height, txs: vec![] });
-            }
-            0x03 | 0x04 => {
-                // 0x03 = full raw tx, 0x04 = compact tx
-                // In compact format, add to the current block (last in blocks vec)
-                if let Some(last) = blocks.last_mut() {
-                    last.txs.push(payload);
-                } else {
-                    // PivxCompat: txs come before footer
-                    txs.push(payload);
-                }
-            }
-            other => {
-                return Err(format!("Unknown packet type 0x{:02x} in shield binary stream", other).into());
-            }
-        }
-    }
-
-    if blocks.is_empty() { Ok(None) } else { Ok(Some(blocks)) }
-}
-
-/// Process blocks from a stream reader into the wallet state.
+/// Drive the kit's stream parser + block handler to completion, saving every
+/// [`SAVE_INTERVAL`] batches.
 fn sync_stream(
     reader: &mut dyn Read,
     wallet: &mut WalletData,
@@ -99,25 +21,27 @@ fn sync_stream(
     batches_since_save: &mut u32,
 ) -> Result<(), Box<dyn Error>> {
     loop {
-        let raw_blocks = match parse_next_blocks(reader, 10)? {
+        let raw_blocks = match kit_sync::parse_next_blocks(reader, 10)? {
             Some(b) => b,
             None => break,
         };
 
-        let shield_blocks: Vec<ShieldBlock> = raw_blocks
-            .iter()
+        let shield_blocks: Vec<shield_sync::ShieldBlock> = raw_blocks
+            .into_iter()
             .filter(|b| b.height as i32 > wallet.last_block)
-            .map(|b| ShieldBlock { height: b.height, txs: b.txs.clone() })
             .collect();
 
         if shield_blocks.is_empty() {
-            if let Some(last) = raw_blocks.last() {
-                wallet.last_block = last.height as i32;
-            }
             continue;
         }
 
-        let result = shield::handle_blocks(
+        let last_height = shield_blocks
+            .last()
+            .map(|b| b.height)
+            .unwrap_or(wallet.last_block as u32);
+        let batch_len = shield_blocks.len() as u32;
+
+        let result = shield_sync::handle_blocks(
             &wallet.commitment_tree,
             shield_blocks,
             &wallet.extfvk,
@@ -131,10 +55,8 @@ fn sync_stream(
         notes.retain(|n| !result.nullifiers.contains(&n.nullifier));
         wallet.unspent_notes = notes;
 
-        if let Some(last) = raw_blocks.last() {
-            wallet.last_block = last.height as i32;
-            *total_blocks += raw_blocks.len() as u32;
-        }
+        wallet.last_block = last_height as i32;
+        *total_blocks += batch_len;
 
         *batches_since_save += 1;
         if *batches_since_save >= SAVE_INTERVAL {
@@ -148,10 +70,7 @@ fn sync_stream(
 }
 
 /// Sync shield data from the network into the wallet.
-pub fn sync_shield(
-    wallet: &mut WalletData,
-    net: &PivxNetwork,
-) -> Result<u32, Box<dyn Error>> {
+pub fn sync_shield(wallet: &mut WalletData, net: &PivxNetwork) -> Result<u32, Box<dyn Error>> {
     let start_block = (wallet.last_block + 1) as u32;
     let mut reader = net.get_shield_data(start_block)?;
     let mut total_blocks = 0u32;
@@ -159,8 +78,7 @@ pub fn sync_shield(
 
     sync_stream(&mut *reader, wallet, &mut total_blocks, &mut batches_since_save)?;
 
-    // Validate sapling root — auto-heal if corrupted
-    if let Err(_) = validate_sapling_root(wallet, net) {
+    if validate_sapling_root(wallet, net).is_err() {
         eprintln!("Sapling root mismatch detected. Auto-recovering...");
         crate::wallet::reset_to_checkpoint(wallet)?;
         crate::wallet::save_wallet(wallet)?;
@@ -172,11 +90,11 @@ pub fn sync_shield(
 
         sync_stream(&mut *reader, wallet, &mut total_blocks, &mut batches_since_save)?;
 
-        // Verify recovery succeeded
-        if let Err(_) = validate_sapling_root(wallet, net) {
-            return Err("Sapling root mismatch persists after recovery. RPC data may be compromised.".into());
+        if validate_sapling_root(wallet, net).is_err() {
+            return Err(
+                "Sapling root mismatch persists after recovery. RPC data may be compromised.".into(),
+            );
         }
-
         eprintln!(" recovered.");
     }
 
@@ -184,59 +102,23 @@ pub fn sync_shield(
 }
 
 #[inline]
-fn validate_sapling_root(
-    wallet: &WalletData,
-    net: &PivxNetwork,
-) -> Result<(), Box<dyn Error>> {
-    let our_root = crate::shield::get_sapling_root(&wallet.commitment_tree)?;
+fn validate_sapling_root(wallet: &WalletData, net: &PivxNetwork) -> Result<(), Box<dyn Error>> {
+    let our_root = tree::get_sapling_root(&wallet.commitment_tree)?;
     let block = net.get_block(wallet.last_block as u32)?;
     let network_root = block
         .get("finalsaplingroot")
         .and_then(|r| r.as_str())
         .unwrap_or("");
-
     if !network_root.is_empty() && our_root != network_root {
         return Err("mismatch".into());
     }
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Transparent UTXO sync
-// ---------------------------------------------------------------------------
-
-use crate::wallet::SerializedUTXO;
-
 /// Sync transparent UTXOs for the wallet's transparent address.
-/// Simple: fetch all confirmed UTXOs from Blockbook and replace the stored set.
 pub fn sync_transparent(wallet: &mut WalletData, net: &PivxNetwork) -> Result<(), Box<dyn Error>> {
     let address = wallet.get_transparent_address()?;
     let raw_utxos = net.get_utxos(&address)?;
-
-    let mut utxos = Vec::new();
-    for u in &raw_utxos {
-        let txid = u["txid"].as_str().unwrap_or_default().to_string();
-        let vout = u["vout"].as_u64().unwrap_or(0) as u32;
-        let amount = u["value"]
-            .as_str()
-            .and_then(|s| s.parse::<u64>().ok())
-            .or_else(|| u["value"].as_u64())
-            .unwrap_or(0);
-        let height = u["height"].as_u64().unwrap_or(0) as u32;
-
-        if txid.is_empty() || amount == 0 {
-            continue;
-        }
-
-        utxos.push(SerializedUTXO {
-            txid,
-            vout,
-            amount,
-            script: String::new(), // Blockbook doesn't always return scripts; we derive on-the-fly
-            height,
-        });
-    }
-
-    wallet.unspent_utxos = utxos;
+    wallet.unspent_utxos = kit_wallet::parse_blockbook_utxos(&raw_utxos);
     Ok(())
 }

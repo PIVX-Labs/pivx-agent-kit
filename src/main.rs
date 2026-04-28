@@ -1,13 +1,11 @@
-mod checkpoint;
 mod core;
 mod keys;
-mod mainnet_checkpoints;
 mod mcp;
 mod network;
 mod prover;
 mod shield;
-mod simd;
 mod sync;
+mod task;
 mod updater;
 mod wallet;
 
@@ -31,8 +29,16 @@ Commands:
   send <address> <amount> --from <private|public> [memo]
                                                 Send PIV from private or public balance
   resync                                        Reset and re-sync from checkpoint
+  sign-message <message>                        Sign a message with the transparent privkey
+                                                (base64 sig compatible with PIVX Core verifymessage)
   export                                        Export wallet seed phrase for migration
   serve                                         Run as MCP server (for AI agent integration)
+  task <subcommand>                             PIVX Tasks platform client.
+                                                Read:    list, search, get, profile
+                                                Worker:  signup, submit
+                                                Creator: create, approve, reject, cancel
+                                                Inbox:   notifications
+                                                Run `task` with no args for full usage.
   update                                        Update to the latest release", VERSION)
 }
 
@@ -59,9 +65,20 @@ fn main() {
             let confirm = args.get(1).map(|s| s.as_str()) == Some("true");
             core::export(confirm)
         }
+        Some("sign-message") => {
+            let message = args.get(1..).map(|words| words.join(" "));
+            match message {
+                Some(m) if !m.is_empty() => core::sign_message(&m),
+                _ => Err("Usage: pivx-agent-kit sign-message <message>".into()),
+            }
+        }
         Some("address") => core::address(),
         Some("balance") => core::balance(),
         Some("resync") => core::resync(),
+        Some("task") => {
+            let sub_args: Vec<String> = args.iter().skip(1).cloned().collect();
+            task::dispatch(&sub_args)
+        }
         Some("send") => {
             let addr = args.get(1).map(|s| s.as_str());
             let amount_str = args.get(2).map(|s| s.as_str());

@@ -1,6 +1,6 @@
 [package]
 name = "pivx-agent-kit"
-version = "0.3.2"
+version = "0.5.0"
 edition = "2021"
 description = "PIVX Agent Kit – CLI toolbox for AI agents to interact with the PIVX blockchain"
 repository = "https://github.com/PIVX-Labs/pivx-agent-kit"
@@ -11,38 +11,27 @@ name = "pivx-agent-kit"
 path = "src/main.rs"
 
 [dependencies]
-# PIVX Sapling cryptographic libraries (librustpivx fork of zcash libs)
-sapling = { git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase" }
-pivx_primitives = { package = "zcash_primitives", git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase", default-features = false, features = ["transparent-inputs", "circuits", "std", "non-standard-fees"] }
-pivx_client_backend = { package = "zcash_client_backend", git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase" }
-pivx_protocol = { package = "zcash_protocol", git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase", default-features = false }
-zcash_keys = { git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase", features = ["unstable"] }
-zcash_transparent = { git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase" }
-bellman = { git = "https://github.com/Duddino/librustpivx", branch = "librustzcash-rebase", features = ["groth16"] }
-incrementalmerkletree = "0.7"
+# Shared PIVX wallet core — keys, sapling, tx builders, sync logic, wallet state.
+pivx-wallet-kit = { path = "../pivx-wallet-kit" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# BIP39 mnemonic generation
+
+# BIP39 mnemonic parsing (used by the export/verify path in wallet.rs).
 bip39 = "2"
 
 # HTTP client (blocking, no async runtime needed)
 ureq = "2"
 
-# Cryptographic utilities
-secp256k1 = "0.29"
-rand_core = { version = "0.6", features = ["std"] }
+# Cryptographic utilities still needed at the CLI layer for device-bound key derivation.
 sha2 = "0.10"
 zeroize = { version = "1.8", features = ["derive"] }
 
 # System
 dirs = "5"
 machine-uid = "0.5"
-bip32 = "0.5"
-ripemd = "0.1"
-bs58 = "0.5.1"
-zcash_note_encryption = "0.4"
+rand_core = { version = "0.6", features = ["std"] }
 
 [patch.crates-io]
 orchard = { git = "https://github.com/zcash/orchard.git", rev = "c684e9185a0449efb00428f807d3bf286b5dae03" }

@@ -1,31 +1,22 @@
-//! Sapling proving parameter management.
-//! Downloads, caches, and loads the Groth16 parameters needed for proof generation.
+//! Sapling proving parameter download + on-disk cache.
+//!
+//! The kit verifies hashes and parses bytes; this shim handles the network
+//! fetch and filesystem cache that native consumers need.
 
-use sapling::circuit::{OutputParameters, SpendParameters};
-use sha2::{Digest, Sha256};
+use pivx_wallet_kit::sapling::prover::{verify_and_load_params, SaplingProver};
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-pub type ImplTxProver = (OutputParameters, SpendParameters);
-
-static PROVER: OnceLock<ImplTxProver> = OnceLock::new();
-
-const OUTPUT_PARAMS_SHA256: &str =
-    "2f0ebbcbb9bb0bcffe95a397e7eba89c29eb4dde6191c339db88570e3f3fb0e4";
-const SPEND_PARAMS_SHA256: &str =
-    "8e48ffd23abb3a5fd9c5589204f32d9c31285a04b78096ba40a79b75677efc13";
+static PROVER: OnceLock<SaplingProver> = OnceLock::new();
 
 fn params_dir() -> PathBuf {
     crate::wallet::get_data_dir().join("params")
 }
 
-fn sha256_hex(data: &[u8]) -> String {
-    crate::simd::hex::bytes_to_hex_string(&Sha256::digest(data))
-}
-
-/// Ensure the prover is loaded (from cache or download)
+/// Load the prover from the on-disk cache, downloading if absent.
+/// Idempotent — subsequent calls are no-ops.
 pub fn ensure_prover_loaded() -> Result<(), Box<dyn Error>> {
     if PROVER.get().is_some() {
         return Ok(());
@@ -51,22 +42,13 @@ pub fn ensure_prover_loaded() -> Result<(), Box<dyn Error>> {
         (output, spend)
     };
 
-    if sha256_hex(&output_bytes) != OUTPUT_PARAMS_SHA256 {
-        return Err("SHA256 mismatch for sapling output parameters".into());
-    }
-    if sha256_hex(&spend_bytes) != SPEND_PARAMS_SHA256 {
-        return Err("SHA256 mismatch for sapling spend parameters".into());
-    }
-
-    let output_params = OutputParameters::read(&output_bytes[..], false)?;
-    let spend_params = SpendParameters::read(&spend_bytes[..], false)?;
-
-    let _ = PROVER.set((output_params, spend_params));
+    let loaded = verify_and_load_params(&output_bytes, &spend_bytes)?;
+    let _ = PROVER.set(loaded);
     Ok(())
 }
 
-/// Get a reference to the loaded prover
-pub fn get_prover() -> Result<&'static ImplTxProver, Box<dyn Error>> {
+/// Get a reference to the loaded prover. Panics if [`ensure_prover_loaded`] hasn't been called.
+pub fn get_prover() -> Result<&'static SaplingProver, Box<dyn Error>> {
     PROVER
         .get()
         .ok_or_else(|| "Prover not loaded. Call ensure_prover_loaded() first.".into())

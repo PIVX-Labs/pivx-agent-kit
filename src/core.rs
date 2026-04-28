@@ -8,40 +8,11 @@ use std::error::Error;
 pub type Result = std::result::Result<serde_json::Value, Box<dyn Error>>;
 
 
-/// Parse a PIV amount string to satoshis with exact integer precision
-pub fn parse_piv_to_sat(s: &str) -> std::result::Result<u64, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("Empty amount".into());
-    }
-
-    let parts: Vec<&str> = s.split('.').collect();
-    if parts.len() > 2 {
-        return Err("Invalid amount format".into());
-    }
-
-    let integer_part: u64 = parts[0].parse().map_err(|_| "Invalid amount")?;
-
-    let fractional_sat = if parts.len() == 2 {
-        let frac = parts[1];
-        if frac.len() > 8 {
-            return Err("Too many decimal places (max 8)".into());
-        }
-        if frac.is_empty() {
-            0u64
-        } else {
-            let frac_val: u64 = frac.parse().map_err(|_| "Invalid decimal")?;
-            frac_val * 10u64.pow(8 - frac.len() as u32)
-        }
-    } else {
-        0
-    };
-
-    integer_part
-        .checked_mul(100_000_000)
-        .and_then(|v| v.checked_add(fractional_sat))
-        .ok_or_else(|| "Amount overflow".to_string())
-}
+/// Parse a PIV amount string to satoshis with exact integer precision.
+///
+/// Thin re-export of [`pivx_wallet_kit::amount::parse_piv_to_sat`] so existing
+/// CLI callers keep working.
+pub use pivx_wallet_kit::amount::parse_piv_to_sat;
 
 /// Sync wallet to the chain tip (both shield and transparent). Saves to disk if blocks were processed.
 pub fn sync(wallet_data: &mut wallet::WalletData) -> std::result::Result<(), Box<dyn Error>> {
@@ -137,6 +108,32 @@ pub fn resync() -> Result {
         "unspent_notes": wallet_data.unspent_notes.len(),
         "unspent_utxos": wallet_data.unspent_utxos.len(),
         "synced_to_block": wallet_data.last_block
+    }))
+}
+
+/// Sign an arbitrary message with the wallet's transparent (D-prefix)
+/// private key. Returns a base64 signature byte-compatible with PIVX
+/// Core's `verifymessage` RPC and the address that signed.
+///
+/// Unlike `export`, the seed never leaves the wallet — only the per-message
+/// signature does. This is the right primitive for proving address
+/// ownership to platforms (auth headers, link your address to a profile,
+/// challenge-response flows) without exposing the master key.
+pub fn sign_message(message: &str) -> Result {
+    use pivx_wallet_kit::{keys as kit_keys, messages};
+    let wallet_data = wallet::load_wallet()?;
+    let bip39_seed = wallet_data.get_bip39_seed();
+    let (address, _pubkey, privkey_bytes) =
+        kit_keys::transparent_key_from_bip39_seed(&bip39_seed, 0, 0)?;
+    let privkey: [u8; 32] = privkey_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "transparent privkey is not 32 bytes")?;
+    let signature = messages::sign_message(&privkey, message)?;
+    Ok(json!({
+        "address": address,
+        "message": message,
+        "signature": signature,
     }))
 }
 

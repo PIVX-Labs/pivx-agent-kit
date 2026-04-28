@@ -3,7 +3,7 @@
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::process::{Command, Stdio};
 
 const REPO: &str = "PIVX-Labs/pivx-agent-kit";
@@ -108,7 +108,7 @@ pub fn update() -> Result<serde_json::Value, Box<dyn Error>> {
     eprintln!("Downloading {}...", archive_name);
     let archive = download(&tag, &archive_name)?;
 
-    let actual = crate::simd::hex::bytes_to_hex_string(&Sha256::digest(&archive));
+    let actual = pivx_wallet_kit::simd::hex::bytes_to_hex_string(&Sha256::digest(&archive));
     if actual != expected {
         return Err(format!(
             "SHA256 mismatch — download may be corrupted or tampered.\n  expected: {}\n  got:      {}",
