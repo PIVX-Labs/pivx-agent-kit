@@ -57,10 +57,12 @@ Discovery:
 Order lifecycle:
   order create <slug> --amount <N>              Open an invoice. Refund address is the
                                                 kit's transparent address automatically.
-  order pay    <id> [--from private|public]     Send the order's PIV from the wallet
-                                                (private = shield, public = transparent).
+  order pay    <id> [--from private|public]     Send the order's PIV from the wallet.
                                                 Validates state and uses the platform's
-                                                quoted price; defaults to private.
+                                                quoted price. Balance pool is
+                                                auto-selected (prefers private/shield
+                                                for privacy, falls back to public/
+                                                transparent). Pass --from to override.
   order check  <id>                             Status + (when COMPLETE) dispatch payload
                                                 (redemption code/pin).
   order cancel <id>                             Cancel a PENDING / PARTIAL_PENDING order.

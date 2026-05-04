@@ -358,12 +358,12 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "pivx_cards_order_pay",
-            "description": "Pay an open order by sending the platform's quoted PIV amount to its payment_address. Re-fetches the order to validate state (must be PENDING) and pull the canonical address + amount; the agent doesn't have to handle either. Returns the broadcast txid. After this, poll pivx_cards_order_check until status_num == 5 to retrieve the redemption code.",
+            "description": "Pay an open order by sending the platform's quoted PIV amount to its payment_address. Re-fetches the order to validate state (must be PENDING) and pull the canonical address + amount; the agent doesn't have to handle either. Returns the broadcast txid. After this, poll pivx_cards_order_check until status_num == 5 to retrieve the redemption code. Balance pool is auto-selected — prefers private (shield) for privacy, falls back to public (transparent) if private can't cover. Pass `from` explicitly only to override.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "order_id": { "type": "string", "description": "Order id returned by order_create" },
-                    "from": { "type": "string", "description": "Which balance to spend from: 'private' (shield, default) or 'public' (transparent)." }
+                    "from": { "type": "string", "description": "Optional: force a specific pool — 'private' (shield) or 'public' (transparent). Omit to auto-select based on which pool can cover the cost." }
                 },
                 "required": ["order_id"]
             }

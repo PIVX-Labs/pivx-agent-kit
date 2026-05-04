@@ -251,9 +251,17 @@ pub fn order_cancel(args: &[String]) -> Result {
 /// order state first to (a) verify it's still PENDING and (b) get
 /// the canonical `paymentAddress` and `paymentTotal` from the
 /// platform — the agent doesn't have to thread those through itself.
+///
+/// Balance selection: when `--from` is omitted, picks a pool that
+/// can cover `amount + fee_buffer`. Prefers `private` (shield) for
+/// privacy, falls back to `public` (transparent). Errors with a
+/// readable message if neither pool alone covers the cost. An
+/// explicit `--from` skips the auto-select and goes directly to
+/// `core::send`, which will surface its own insufficient-funds
+/// error if the chosen pool is short.
 pub fn order_pay(args: &[String]) -> Result {
     let mut id: Option<String> = None;
-    let mut from = "private".to_string();
+    let mut from_explicit: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -264,7 +272,7 @@ pub fn order_pay(args: &[String]) -> Result {
                 if v != "private" && v != "public" {
                     return Err("--from must be 'private' or 'public'".into());
                 }
-                from = v.to_string();
+                from_explicit = Some(v.to_string());
                 i += 2;
             }
             other if !other.starts_with("--") && id.is_none() => {
@@ -312,17 +320,72 @@ pub fn order_pay(args: &[String]) -> Result {
     let amount_sat = core::parse_piv_to_sat(&amount_piv)
         .map_err(|e| format!("could not parse paymentTotal '{}': {}", amount_piv, e))?;
 
+    // Decide which pool to spend from.
+    let (from, auto_chosen) = match from_explicit {
+        Some(f) => (f, false),
+        None => (auto_select_pool(amount_sat)?, true),
+    };
+
     let send_result = core::send(&payment_address, amount_sat, "", &from)?;
 
     Ok(json!({
         "order_id": id,
         "from": from,
+        "from_auto_selected": auto_chosen,
         "amount_piv": amount_piv,
         "amount_sat": amount_sat,
         "payment_address": payment_address,
         "send_result": send_result,
         "_hint": "Poll `cards order check <order-id>` until status_num == 5 (COMPLETE). The dispatch field will then carry the redemption code/pin.",
     }))
+}
+
+/// Pick `private` or `public` based on which pool can cover
+/// `amount_sat + fee_buffer`. Sources balances via `core::balance`,
+/// which loads + syncs the wallet. The fee buffer is sized for the
+/// more expensive (shield) path so the same threshold works for
+/// either pool — better to over-reserve and pick public than to
+/// pick private and trip an insufficient-fee error mid-build.
+fn auto_select_pool(amount_sat: u64) -> std::result::Result<String, Box<dyn Error>> {
+    // 0.05 PIV — comfortably above the ~0.022 PIV shield-spend fee
+    // we observed on the live Viettel purchase, with margin for
+    // network-fee bumps. Transparent fees are tiny (~0.0002 PIV)
+    // so this only really constrains the private side.
+    const FEE_BUFFER_SAT: u64 = 5_000_000;
+
+    let bal = core::balance()?;
+    let private_sat = bal
+        .get("private_balance_sat")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let public_sat = bal
+        .get("public_balance_sat")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let needed = amount_sat.saturating_add(FEE_BUFFER_SAT);
+
+    if private_sat >= needed {
+        return Ok("private".to_string());
+    }
+    if public_sat >= needed {
+        return Ok("public".to_string());
+    }
+
+    // Neither pool covers it on its own. Splitting across pools
+    // would mean two on-chain transactions — left out for now;
+    // surface the constraint instead.
+    Err(format!(
+        "insufficient balance for this order: needs {} sat (+ ~{} sat fee buffer); private has {} sat ({:.4} PIV), public has {} sat ({:.4} PIV), total {} sat ({:.4} PIV). Top up the wallet, or pass --from explicitly to attempt anyway.",
+        amount_sat,
+        FEE_BUFFER_SAT,
+        private_sat,
+        private_sat as f64 / 1e8,
+        public_sat,
+        public_sat as f64 / 1e8,
+        private_sat + public_sat,
+        (private_sat + public_sat) as f64 / 1e8,
+    )
+    .into())
 }
 
 pub fn order_list(_args: &[String]) -> Result {
