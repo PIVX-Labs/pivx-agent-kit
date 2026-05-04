@@ -1,3 +1,4 @@
+mod cards;
 mod core;
 mod keys;
 mod mcp;
@@ -39,6 +40,11 @@ Commands:
                                                 Creator: create, approve, reject, cancel
                                                 Inbox:   notifications
                                                 Run `task` with no args for full usage.
+  cards <subcommand>                            PIVCards (cards.pivxla.bz) — buy gift
+                                                cards (Amazon, Steam, Uber, …) with PIV.
+                                                Discovery: regions, search, details
+                                                Order:     order create|pay|check|cancel|list
+                                                Run `cards` with no args for full usage.
   update                                        Update to the latest release", VERSION)
 }
 
@@ -78,6 +84,10 @@ fn main() {
         Some("task") => {
             let sub_args: Vec<String> = args.iter().skip(1).cloned().collect();
             task::dispatch(&sub_args)
+        }
+        Some("cards") => {
+            let sub_args: Vec<String> = args.iter().skip(1).cloned().collect();
+            cards::dispatch(&sub_args)
         }
         Some("send") => {
             let addr = args.get(1).map(|s| s.as_str());

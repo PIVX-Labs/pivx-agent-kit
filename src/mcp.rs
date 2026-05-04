@@ -1,6 +1,7 @@
 //! MCP (Model Context Protocol) server.
 //! JSON-RPC over stdin/stdout. Each tool call loads wallet from disk independently.
 
+use crate::cards;
 use crate::core;
 use crate::task;
 use serde_json::{json, Value};
@@ -295,6 +296,108 @@ fn tool_definitions() -> Value {
                 },
                 "required": ["id"]
             }
+        },
+
+        // ---------------------------------------------------------
+        // PIVCards (https://cards.pivxla.bz). Spend PIV at real-world
+        // stores (Amazon, Steam, Uber, …). The platform fronts
+        // Bitrefill across regional egress IPs to preserve regional
+        // pricing / catalog. PIVCards is unauthenticated — order
+        // privacy is via the random 32-byte order ID itself, which
+        // the kit caches locally per-wallet so the agent doesn't
+        // need to persist it.
+        //
+        // Refund address is always the kit's own transparent address
+        // — there's no parameter for it. If an order is cancelled
+        // for any reason, funds return to the wallet automatically.
+        // ---------------------------------------------------------
+
+        {
+            "name": "pivx_cards_regions",
+            "description": "List supported region codes for PIVCards (e.g. EU, DE, GB, US, CA). Some products are region-locked, so call this before searching to know what's available.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        },
+        {
+            "name": "pivx_cards_search",
+            "description": "Search PIVCards' catalog for buyable gift cards by brand or keyword (e.g. 'amazon', 'steam', 'uber'). Optionally pin to a region for region-specific catalog. Returns slugs you'll pass to pivx_cards_details / pivx_cards_order_create.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Brand / keyword to search for" },
+                    "region": { "type": "string", "description": "Region code (EU, DE, GB, US, CA). Omit to search global catalog." }
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "pivx_cards_details",
+            "description": "Fetch full details for a single card item by slug, including the available packages (denominations) you can buy. Returns `buyable: false` for items that need a phone/email recipient (those can't be purchased through the kit). Always check this before calling order_create.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string", "description": "Item slug from search results (e.g. 'amazon_ca-canada')" }
+                },
+                "required": ["slug"]
+            }
+        },
+        {
+            "name": "pivx_cards_order_create",
+            "description": "Open an invoice for a specific package of a specific card. Returns an order id, payment_address, and payment_total_piv. Refund address is automatically the kit's transparent address — funds return there if the order is cancelled. Order ID is cached locally; you can list outstanding orders with pivx_cards_order_list.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "slug": { "type": "string", "description": "Item slug (from search/details)" },
+                    "amount": { "type": "string", "description": "Denomination value matching one of the item's packages, as a decimal string (e.g. '50' for a $50 card). Strings avoid JSON-number precision loss." }
+                },
+                "required": ["slug", "amount"]
+            }
+        },
+        {
+            "name": "pivx_cards_order_pay",
+            "description": "Pay an open order by sending the platform's quoted PIV amount to its payment_address. Re-fetches the order to validate state (must be PENDING) and pull the canonical address + amount; the agent doesn't have to handle either. Returns the broadcast txid. After this, poll pivx_cards_order_check until status_num == 5 to retrieve the redemption code.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "order_id": { "type": "string", "description": "Order id returned by order_create" },
+                    "from": { "type": "string", "description": "Which balance to spend from: 'private' (shield, default) or 'public' (transparent)." }
+                },
+                "required": ["order_id"]
+            }
+        },
+        {
+            "name": "pivx_cards_order_check",
+            "description": "Poll the status of an order. Returns status_num (1=PENDING, 2=PARTIAL_PENDING, 3=PROCESSING, 4=WAITING, 5=COMPLETE, 6=CANCELLED) plus the dispatch payload. The dispatch field is null until status_num == 5 — at that point it carries the redemption code/pin for the purchased card.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "order_id": { "type": "string", "description": "Order id" }
+                },
+                "required": ["order_id"]
+            }
+        },
+        {
+            "name": "pivx_cards_order_cancel",
+            "description": "Cancel a PENDING or PARTIAL_PENDING order. Cannot be called on PROCESSING / WAITING / COMPLETE orders. Any partial payment received returns to the kit's transparent address (the order's refund_address).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "order_id": { "type": "string", "description": "Order id" }
+                },
+                "required": ["order_id"]
+            }
+        },
+        {
+            "name": "pivx_cards_order_list",
+            "description": "List all PIVCards orders this wallet has ever created (cached locally). Useful for the agent to find an old order id without having to persist it itself. Includes terminal states (cancelled, complete) — kept on the assumption an agent may want to re-fetch the dispatch payload of a complete order later.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
         }
     ])
 }
@@ -566,6 +669,85 @@ fn dispatch_tool(name: &str, args: &Value) -> core::Result {
                 .ok_or("'id' is required and must be a number")?;
             task::commands::notifications(&["dismiss".into(), id.to_string()])
         }
+
+        // ---------------------------------------------------------
+        // PIVCards dispatch
+        // ---------------------------------------------------------
+
+        "pivx_cards_regions" => cards::commands::regions(&[]),
+
+        "pivx_cards_search" => {
+            let query = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .ok_or("'query' is required")?;
+            let mut argv = vec![query.to_string()];
+            push_str_flag(&mut argv, "--region", args.get("region"));
+            cards::commands::search(&argv)
+        }
+
+        "pivx_cards_details" => {
+            let slug = args
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .ok_or("'slug' is required")?
+                .to_string();
+            cards::commands::details(&[slug])
+        }
+
+        "pivx_cards_order_create" => {
+            let slug = args
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .ok_or("'slug' is required")?
+                .to_string();
+            // Accept amount as either a string ("50") or a number (50)
+            // since both shapes are common in MCP clients. Stringify
+            // numbers ourselves to avoid JSON-side precision loss.
+            let amount = if let Some(s) = args.get("amount").and_then(|v| v.as_str()) {
+                s.to_string()
+            } else if let Some(n) = args.get("amount") {
+                if n.is_number() {
+                    n.to_string()
+                } else {
+                    return Err("'amount' must be a string or number".into());
+                }
+            } else {
+                return Err("'amount' is required".into());
+            };
+            cards::commands::order_create(&[slug, "--amount".into(), amount])
+        }
+
+        "pivx_cards_order_pay" => {
+            let id = args
+                .get("order_id")
+                .and_then(|v| v.as_str())
+                .ok_or("'order_id' is required")?
+                .to_string();
+            let mut argv = vec![id];
+            push_str_flag(&mut argv, "--from", args.get("from"));
+            cards::commands::order_pay(&argv)
+        }
+
+        "pivx_cards_order_check" => {
+            let id = args
+                .get("order_id")
+                .and_then(|v| v.as_str())
+                .ok_or("'order_id' is required")?
+                .to_string();
+            cards::commands::order_check(&[id])
+        }
+
+        "pivx_cards_order_cancel" => {
+            let id = args
+                .get("order_id")
+                .and_then(|v| v.as_str())
+                .ok_or("'order_id' is required")?
+                .to_string();
+            cards::commands::order_cancel(&[id])
+        }
+
+        "pivx_cards_order_list" => cards::commands::order_list(&[]),
 
         _ => Err(format!("Unknown tool: {}", name).into()),
     }
