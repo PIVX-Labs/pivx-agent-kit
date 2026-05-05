@@ -43,6 +43,11 @@ pub fn ensure_prover_loaded() -> Result<(), Box<dyn Error>> {
     };
 
     let loaded = verify_and_load_params(&output_bytes, &spend_bytes)?;
+    // OnceLock::set returns Err only if another thread populated the
+    // cell between our is_some() check above and this set(). That can
+    // only happen if two ensure_prover_loaded() calls race; both
+    // threads end up with the same SHA256-verified prover, so
+    // silently dropping the duplicate is correct.
     let _ = PROVER.set(loaded);
     Ok(())
 }
