@@ -70,7 +70,7 @@ fn save(state: &CardsState) -> Result<(), Box<dyn Error>> {
 fn current_address() -> Option<String> {
     use pivx_wallet_kit::keys as kit_keys;
     let wallet_data = wallet::load_wallet().ok()?;
-    let bip39_seed = wallet_data.get_bip39_seed();
+    let bip39_seed = wallet_data.get_bip39_seed().ok()?;
     let (address, _pubkey, _privkey) =
         kit_keys::transparent_key_from_bip39_seed(&bip39_seed, 0, 0).ok()?;
     Some(address)

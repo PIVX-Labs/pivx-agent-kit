@@ -41,11 +41,15 @@ fn sync_stream(
             .unwrap_or(wallet.last_block as u32);
         let batch_len = shield_blocks.len() as u32;
 
+        // Clone (not mem::take): if handle_blocks errors mid-batch we
+        // do not want to strand the wallet with an empty note set —
+        // the next sync attempt should resume from a coherent state.
+        let existing = wallet.unspent_notes.clone();
         let result = shield_sync::handle_blocks(
             &wallet.commitment_tree,
             shield_blocks,
             &wallet.extfvk,
-            &wallet.unspent_notes,
+            existing,
         )?;
 
         wallet.commitment_tree = result.commitment_tree;

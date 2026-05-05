@@ -14,7 +14,7 @@ path = "src/main.rs"
 # Shared PIVX wallet core — keys, sapling, tx builders, sync logic, wallet state.
 # Pinned to a specific commit for reproducible release builds. Bump the rev
 # when you need a new wallet-kit feature; CI will rebuild against the new pin.
-pivx-wallet-kit = { git = "https://github.com/PIVX-Labs/pivx-wallet-kit", rev = "7eef42d72aaf295bc49c18b332ab77013ea949a6" }
+pivx-wallet-kit = { git = "https://github.com/PIVX-Labs/pivx-wallet-kit", rev = "a433c1c" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

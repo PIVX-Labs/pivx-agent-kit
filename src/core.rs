@@ -122,13 +122,9 @@ pub fn resync() -> Result {
 pub fn sign_message(message: &str) -> Result {
     use pivx_wallet_kit::{keys as kit_keys, messages};
     let wallet_data = wallet::load_wallet()?;
-    let bip39_seed = wallet_data.get_bip39_seed();
-    let (address, _pubkey, privkey_bytes) =
+    let bip39_seed = wallet_data.get_bip39_seed()?;
+    let (address, _pubkey, privkey) =
         kit_keys::transparent_key_from_bip39_seed(&bip39_seed, 0, 0)?;
-    let privkey: [u8; 32] = privkey_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| "transparent privkey is not 32 bytes")?;
     let signature = messages::sign_message(&privkey, message)?;
     Ok(json!({
         "address": address,
@@ -258,7 +254,7 @@ pub fn send(address: &str, amount_sat: u64, memo: &str, from: &str) -> Result {
             }))
         }
         "public" => {
-            let bip39_seed = wallet_data.get_bip39_seed();
+            let bip39_seed = wallet_data.get_bip39_seed()?;
 
             let result = shield::create_raw_transparent_transaction(
                 &mut wallet_data,
