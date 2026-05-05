@@ -113,6 +113,24 @@ pub fn get(args: &[String]) -> Result<Value, Box<dyn Error>> {
 }
 
 // ---------------------------------------------------------------------
+// proofs
+// ---------------------------------------------------------------------
+
+/// List proof submissions on a task. Creator-only — the platform's
+/// auth middleware rejects requests from non-creators with 401, so
+/// this returns nothing useful when called against someone else's
+/// task. Use it to read submission bodies before deciding whether to
+/// `approve` or `reject`.
+pub fn proofs(args: &[String]) -> Result<Value, Box<dyn Error>> {
+    let id = args
+        .first()
+        .ok_or("Usage: pivx-agent-kit task proofs <id-or-url>")?;
+    let id = parse_task_id(id)?;
+    let client = Client::new();
+    client.get_signed(&format!("/api/tasks/{}/proofs", id))
+}
+
+// ---------------------------------------------------------------------
 // signup
 // ---------------------------------------------------------------------
 

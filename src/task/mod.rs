@@ -23,6 +23,7 @@ pub fn dispatch(args: &[String]) -> Result<Value, Box<dyn Error>> {
         "list" => commands::list(&rest),
         "search" => commands::search(&rest),
         "get" => commands::get(&rest),
+        "proofs" => commands::proofs(&rest),
         "signup" => commands::signup(&rest),
         "submit" => commands::submit(&rest),
         "create" => commands::create(&rest),
@@ -56,6 +57,10 @@ Creator:
   create  --title T --description D --category C --amount A
           [--currency PIV] [--verification V] [--quantity Q] [--min-rep R]
                                                 Post a new task
+  proofs  <id-or-url>                           List submitted proof bodies on a
+                                                task you created (creator-only —
+                                                use this to read deliveries before
+                                                approve/reject)
   approve <id-or-url> --worker <handle> [--from public|private] [--txid <hex>]
                                                 Auto-pay the bounty from the kit's
                                                 wallet, then mark approved. Pass
