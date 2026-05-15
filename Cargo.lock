@@ -1356,8 +1356,8 @@ dependencies = [
 
 [[package]]
 name = "pivx-wallet-kit"
-version = "0.2.0"
-source = "git+https://github.com/PIVX-Labs/pivx-wallet-kit?rev=a433c1c#a433c1c015f35a9893cf95f143ad8d6c9517272a"
+version = "0.2.1"
+source = "git+https://github.com/PIVX-Labs/pivx-wallet-kit?tag=v0.2.1#ef0f134095026ad35e3234cc46b3e795ef8bec8a"
 dependencies = [
  "base64",
  "bellman",
@@ -1384,6 +1384,7 @@ dependencies = [
  "zcash_protocol",
  "zcash_transparent",
  "zeroize",
+ "zip32",
 ]
 
 [[package]]
