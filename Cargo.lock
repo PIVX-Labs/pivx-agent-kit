@@ -566,7 +566,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1357,7 +1357,7 @@ dependencies = [
 [[package]]
 name = "pivx-wallet-kit"
 version = "0.2.4"
-source = "git+https://github.com/PIVX-Labs/pivx-wallet-kit?tag=v0.2.4#d5112ee2a38329082bb65cc6d0e33e7a1adb0626"
+source = "git+https://github.com/PIVX-Labs/pivx-wallet-kit?tag=v0.2.4#f59aab7a333079c5bc8161e4da1dc2d6d1539bc8"
 dependencies = [
  "base64",
  "bellman",
@@ -1720,7 +1720,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2073,7 +2073,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
