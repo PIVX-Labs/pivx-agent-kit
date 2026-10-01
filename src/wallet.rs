@@ -24,11 +24,28 @@ fn device_key() -> Result<[u8; 32], Box<dyn Error>> {
     Ok(hasher.finalize().into())
 }
 
+/// A device-bound key for a purpose other than wallet encryption (e.g.
+/// the policy file MAC), separated from it by `tag`.
+pub fn device_subkey(tag: &[u8]) -> Result<[u8; 32], Box<dyn Error>> {
+    let mut hasher = Sha256::new();
+    hasher.update(device_key()?);
+    hasher.update(tag);
+    Ok(hasher.finalize().into())
+}
+
 /// Get the data directory for wallet files.
+#[cfg(not(test))]
 pub fn get_data_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("pivx-agent-kit")
+}
+
+/// Test builds never touch a real wallet: every path that would use the
+/// data directory lands in a per-process scratch directory instead.
+#[cfg(test)]
+pub fn get_data_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("pak-test-datadir-{}", std::process::id()))
 }
 
 #[inline]
@@ -84,3 +101,15 @@ pub fn load_wallet() -> Result<WalletData, Box<dyn Error>> {
     wallet::deserialize_encrypted(&json, &device_key()?)
 }
 
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn tests_never_use_the_real_data_dir() {
+        let dir = super::get_data_dir();
+        assert!(dir.starts_with(std::env::temp_dir()), "{}", dir.display());
+        if let Some(real) = dirs::data_dir() {
+            assert!(!dir.starts_with(real), "{}", dir.display());
+        }
+    }
+}

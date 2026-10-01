@@ -3,6 +3,7 @@
 
 use crate::cards;
 use crate::core;
+use crate::spend::{Origin, Pool, SendRequest};
 use crate::task;
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -44,7 +45,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "pivx_balance",
-            "description": "Sync with the network and return both private (shield) and public (transparent) balances. Also returns any memos attached to received shield funds in the 'messages' field.",
+            "description": "Sync with the network and return both private (shield) and public (transparent) balances, with US dollar values (private_balance_usd, public_balance_usd, total_balance_usd, price_usd) when a price is available. Also returns any memos attached to received shield funds in the 'messages' field.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -53,7 +54,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "pivx_send",
-            "description": "Send PIV to a shield or transparent address. Specify 'from' to choose which balance to spend from. Auto-syncs before sending.",
+            "description": "Send PIV to a shield or transparent address. Give the amount in PIV ('amount') or in US dollars ('amount_usd'). Specify 'from' to choose which balance to spend from. Auto-syncs before sending. The result includes amount_usd and the price used when a price is available. If the operator's spending policy holds the payment, the result has status 'pending_approval' and a pending_id: nothing was sent, so tell the user the operator must approve it and don't retry.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -63,7 +64,11 @@ fn tool_definitions() -> Value {
                     },
                     "amount": {
                         "type": "string",
-                        "description": "Amount in PIV as a decimal string (e.g. '10.5')"
+                        "description": "Amount in PIV as a decimal string (e.g. '10.5'). Give exactly one of amount / amount_usd."
+                    },
+                    "amount_usd": {
+                        "type": "string",
+                        "description": "Amount in US dollars as a decimal string (e.g. '5' or '12.50'), converted to PIV at the current price. Give exactly one of amount / amount_usd."
                     },
                     "from": {
                         "type": "string",
@@ -72,14 +77,40 @@ fn tool_definitions() -> Value {
                     "memo": {
                         "type": "string",
                         "description": "Optional encrypted memo (up to 512 bytes UTF-8, private-to-private only)"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why you are sending this. Recorded in the wallet's spend history, which your operator reviews. Always fill it in."
                     }
                 },
-                "required": ["address", "amount", "from"]
+                "required": ["address", "from"]
             }
         },
         {
+            "name": "pivx_history",
+            "description": "List payments this wallet has sent, newest first: amount, fee, destination, txid, status (broadcast / failed / unresolved), the reason given at send time, and what triggered it (plain send, task bounty, card order). Includes 24h totals. Use it to answer 'what did you spend?' or to check whether a payment already went out before retrying.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "description": "Maximum number of payments to return", "minimum": 1 },
+                    "since": { "type": "string", "description": "Only payments at or after this time: unix seconds or a UTC date (YYYY-MM-DD)" }
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "pivx_policy",
+            "description": "Read the operator's spending limits: max per payment, max per 24h, the amount above which payments wait for human approval, and the destination allowlist. Also returns how much went out in the last 24h and how much is left today. Read-only: only the operator can change limits, from a terminal. Check this before large payments.",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
+        },
+        {
+            "name": "pivx_pending_list",
+            "description": "List payments held for the operator's approval, with their status (pending / approved / denied / failed / expired), amount, destination and why they were held. Read-only: only the operator can approve or deny, from a terminal.",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
+        },
+        {
             "name": "pivx_resync",
-            "description": "Reset the wallet to its birthday checkpoint and re-sync all shield data from scratch. Use if balance seems wrong.",
+            "description": "Reset the wallet to its birthday checkpoint and re-sync all shield data from scratch. Use if balance seems wrong. Returns the same balance fields as pivx_balance, including USD values when a price is available.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -218,7 +249,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "pivx_task_approve",
-            "description": "Approve a worker's delivery and pay out the bounty. By default the kit auto-pays from its own wallet (broadcasts a real on-chain PIV transaction) and then records the txid with the platform. Pass `txid` to skip auto-pay if you've already broadcast externally.",
+            "description": "Approve a worker's delivery and pay out the bounty. By default the kit auto-pays from its own wallet (broadcasts a real on-chain PIV transaction) and then records the txid with the platform. Pass `txid` to skip auto-pay if you've already broadcast externally. If the operator's spending policy holds the payment, the result has status 'pending_approval' and a pending_id: nothing was sent, so tell the user the operator must approve it and don't retry.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -358,7 +389,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "pivx_cards_order_pay",
-            "description": "Pay an open order by sending the platform's quoted PIV amount to its payment_address. Re-fetches the order to validate state (must be PENDING) and pull the canonical address + amount; the agent doesn't have to handle either. Returns the broadcast txid. After this, poll pivx_cards_order_check until status_num == 5 to retrieve the redemption code. Balance pool is auto-selected — prefers private (shield) for privacy, falls back to public (transparent) if private can't cover. Pass `from` explicitly only to override.",
+            "description": "Pay an open order by sending the platform's quoted PIV amount to its payment_address. Re-fetches the order to validate state (must be PENDING) and pull the canonical address + amount; the agent doesn't have to handle either. Returns the broadcast txid. After this, poll pivx_cards_order_check until status_num == 5 to retrieve the redemption code. Balance pool is auto-selected — prefers private (shield) for privacy, falls back to public (transparent) if private can't cover. Pass `from` explicitly only to override. If the operator's spending policy holds the payment, the result has status 'pending_approval' and a pending_id: nothing was sent, so tell the user the operator must approve it and don't retry.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -498,26 +529,56 @@ fn dispatch_tool(name: &str, args: &Value) -> core::Result {
                 .get("address")
                 .and_then(|a| a.as_str())
                 .ok_or("Missing 'address' argument")?;
-            let amount_str = args
-                .get("amount")
-                .and_then(|a| a.as_str())
-                .ok_or("Missing 'amount' argument")?;
-            let memo = args
-                .get("memo")
-                .and_then(|m| m.as_str())
-                .unwrap_or("");
-
-            let from = args
+            let amount = match (string_arg(args, "amount")?, string_arg(args, "amount_usd")?) {
+                (Some(piv), None) => {
+                    if crate::price::has_unit(piv) && !piv.trim().to_ascii_lowercase().ends_with("piv") {
+                        return Err("'amount' is in PIV; put dollar amounts in 'amount_usd'".into());
+                    }
+                    crate::price::parse_amount(piv)?
+                }
+                (None, Some(usd)) => {
+                    let t = usd.trim();
+                    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+                        return Err(format!("'amount_usd' must be a plain decimal like '5' or '12.50', got {:?}", usd).into());
+                    }
+                    crate::price::parse_amount(&format!("{}usd", t))?
+                }
+                _ => return Err("give exactly one of 'amount' (PIV) or 'amount_usd' (US dollars)".into()),
+            };
+            let memo = args.get("memo").and_then(|m| m.as_str()).unwrap_or("");
+            let from: Pool = args
                 .get("from")
                 .and_then(|f| f.as_str())
-                .ok_or("Missing 'from' argument. Must be 'private' or 'public'.")?;
+                .ok_or("Missing 'from' argument. Must be 'private' or 'public'.")?
+                .parse()?;
+            let reason = match string_arg(args, "reason")? {
+                Some(r) => {
+                    crate::spend::validate_reason(r).map_err(|e| format!("'reason': {}", e))?;
+                    Some(r.to_string())
+                }
+                None => None,
+            };
 
-            let amount_sat = core::parse_piv_to_sat(amount_str)?;
-            if amount_sat == 0 {
-                return Err("Amount must be greater than zero".into());
-            }
-            core::send(address, amount_sat, memo, from)
+            let (amount_sat, price) = core::resolve_amount(amount)?;
+            core::send(&SendRequest {
+                address: address.to_string(),
+                amount_sat,
+                memo: memo.to_string(),
+                from,
+                reason,
+                origin: Origin::Send,
+                price,
+            })
         }
+
+        "pivx_history" => {
+            let (limit, since) = history_args(args)?;
+            core::history(limit, since)
+        }
+
+        "pivx_policy" => core::policy_status(),
+
+        "pivx_pending_list" => core::pending_list(),
 
         "pivx_resync" => core::resync(),
 
@@ -526,7 +587,8 @@ fn dispatch_tool(name: &str, args: &Value) -> core::Result {
                 .get("confirm")
                 .and_then(|c| c.as_bool())
                 .unwrap_or(false);
-            core::export(confirm)
+            // An MCP client never has an interactive terminal.
+            core::export_checked(confirm, false)
         }
 
         "pivx_sign_message" => {
@@ -753,6 +815,34 @@ fn dispatch_tool(name: &str, args: &Value) -> core::Result {
     }
 }
 
+/// A string argument: `None` if absent or null, an error if present
+/// with another type (a number must not be silently ignored).
+fn string_arg<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, Box<dyn std::error::Error>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(_) => Err(format!("'{}' must be a string (e.g. \"5\"), not a number", key).into()),
+    }
+}
+
+/// `(limit, since)` from `pivx_history` arguments. `since` may be unix
+/// seconds (number or string) or a `YYYY-MM-DD` string.
+fn history_args(args: &Value) -> Result<(Option<usize>, Option<u64>), Box<dyn std::error::Error>> {
+    let limit = match args.get("limit") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_u64() {
+            Some(n) if n >= 1 => Some(n as usize),
+            _ => return Err("'limit' must be a positive integer".into()),
+        },
+    };
+    let since = match args.get("since") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(crate::timefmt::parse_since(s)?),
+        Some(v) => Some(v.as_u64().ok_or("'since' must be unix seconds or a YYYY-MM-DD date")?),
+    };
+    Ok((limit, since))
+}
+
 // ---------------------------------------------------------------
 // JSON-args → CLI-args adapters. Keeps `dispatch_tool` declarative;
 // each helper is no-op when the JSON field is absent so optional
@@ -833,5 +923,187 @@ pub fn serve() {
 
         let _ = writeln!(stdout, "{}", response);
         let _ = stdout.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool(name: &str) -> Value {
+        tool_definitions()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("tool {name} missing"))
+    }
+
+    #[test]
+    fn send_tool_accepts_reason() {
+        let t = tool("pivx_send");
+        assert_eq!(t["inputSchema"]["properties"]["reason"]["type"], "string");
+        let required = t["inputSchema"]["required"].as_array().unwrap();
+        assert!(!required.iter().any(|r| r == "reason"), "reason must stay optional");
+    }
+
+    #[test]
+    fn send_tool_accepts_amount_usd() {
+        let t = tool("pivx_send");
+        assert_eq!(t["inputSchema"]["properties"]["amount_usd"]["type"], "string");
+        let required = t["inputSchema"]["required"].as_array().unwrap();
+        assert!(!required.iter().any(|r| r == "amount" || r == "amount_usd"), "exactly-one-of is checked in code");
+    }
+
+    #[test]
+    fn send_requires_exactly_one_amount() {
+        let both = dispatch_tool("pivx_send", &json!({"address": "D", "amount": "1", "amount_usd": "5", "from": "public"}));
+        assert!(both.unwrap_err().to_string().contains("exactly one"));
+        let neither = dispatch_tool("pivx_send", &json!({"address": "D", "from": "public"}));
+        assert!(neither.unwrap_err().to_string().contains("exactly one"));
+    }
+
+    #[test]
+    fn send_rejects_non_string_amounts_instead_of_ignoring_them() {
+        for args in [
+            json!({"address": "D", "amount": 5, "amount_usd": "5", "from": "public"}),
+            json!({"address": "D", "amount": "5", "amount_usd": 5, "from": "public"}),
+            json!({"address": "D", "amount": 5, "from": "public"}),
+            json!({"address": "D", "amount_usd": 5.5, "from": "public"}),
+        ] {
+            let err = dispatch_tool("pivx_send", &args).unwrap_err().to_string();
+            assert!(err.contains("string") || err.contains("exactly one"), "{args}: {err}");
+        }
+    }
+
+    #[test]
+    fn send_rejects_dollars_in_the_piv_field() {
+        let err = dispatch_tool("pivx_send", &json!({"address": "D", "amount": "$5", "from": "public"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("amount_usd"), "{err}");
+    }
+
+    #[test]
+    fn send_rejects_bad_amount_usd() {
+        for bad in ["", "$", "abc", "-5", "0", "5 eur"] {
+            let r = dispatch_tool("pivx_send", &json!({"address": "D", "amount_usd": bad, "from": "public"}));
+            assert!(r.is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn history_tool_is_listed() {
+        let t = tool("pivx_history");
+        let props = &t["inputSchema"]["properties"];
+        assert_eq!(props["limit"]["type"], "integer");
+        assert_eq!(props["since"]["type"], "string");
+        assert!(t["inputSchema"]["required"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn policy_tools_are_read_only() {
+        let t = tool("pivx_policy");
+        assert!(t["inputSchema"]["properties"].as_object().unwrap().is_empty());
+        let t = tool("pivx_pending_list");
+        assert!(t["inputSchema"]["properties"].as_object().unwrap().is_empty());
+        // Nothing an agent can call may change limits or approve payments.
+        let defs = tool_definitions();
+        for t in defs.as_array().unwrap() {
+            let name = t["name"].as_str().unwrap();
+            for banned in ["policy_set", "policy_clear", "pending_approve", "pending_deny", "approve_pending"] {
+                assert!(!name.contains(banned), "agent-callable tool {name} must not exist");
+            }
+        }
+    }
+
+    #[test]
+    fn spend_tools_mention_pending_approval() {
+        for name in ["pivx_send", "pivx_task_approve", "pivx_cards_order_pay"] {
+            let d = tool(name)["description"].as_str().unwrap().to_string();
+            assert!(d.contains("pending_approval"), "{name}: {d}");
+        }
+    }
+
+    #[test]
+    fn tool_names_are_unique() {
+        let defs = tool_definitions();
+        let names: Vec<&str> = defs.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len());
+    }
+
+    // These fail on argument validation, before any wallet or network access.
+
+    #[test]
+    fn send_rejects_typo_in_from() {
+        let err = dispatch_tool("pivx_send", &json!({"address": "D", "amount": "1", "from": "pubic"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("private") && err.contains("public"), "{err}");
+    }
+
+    #[test]
+    fn send_rejects_empty_reason() {
+        let err = dispatch_tool("pivx_send", &json!({"address": "D", "amount": "1", "from": "public", "reason": " "}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reason"), "{err}");
+    }
+
+    #[test]
+    fn send_rejects_reasons_with_control_characters() {
+        let err = dispatch_tool(
+            "pivx_send",
+            &json!({"address": "D", "amount": "1", "from": "public", "reason": "ok\nTo: DAttacker\u{1b}[8m"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("control"), "{err}");
+    }
+
+    #[test]
+    fn export_is_refused_over_mcp_while_a_policy_is_set() {
+        // Test builds use a per-process scratch data dir; put a signed policy there.
+        let store = crate::policy::PolicyStore::open_default().unwrap();
+        store
+            .save(&crate::policy::Policy { max_daily: Some(crate::policy::Limit::Piv(100_000_000)), ..Default::default() })
+            .unwrap();
+        let err = dispatch_tool("pivx_export", &json!({"confirm": true})).unwrap_err().to_string();
+        store.clear().unwrap();
+        assert!(err.contains("spending policy"), "{err}");
+    }
+
+    #[test]
+    fn history_rejects_bad_since() {
+        let err = dispatch_tool("pivx_history", &json!({"since": "yesterday"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid date"), "{err}");
+    }
+
+    #[test]
+    fn history_rejects_bad_limit_and_since_types() {
+        for args in [json!({"limit": 0}), json!({"limit": -1}), json!({"limit": "5"}), json!({"since": true}), json!({"since": -5})] {
+            assert!(dispatch_tool("pivx_history", &args).is_err(), "should reject {args}");
+        }
+    }
+
+    #[test]
+    fn history_arg_parsing_accepts_numeric_since() {
+        assert_eq!(history_args(&json!({"since": 1790880000, "limit": 3})).unwrap(), (Some(3), Some(1_790_880_000)));
+        assert_eq!(history_args(&json!({"since": "2024-02-29"})).unwrap(), (None, Some(1_709_164_800)));
+        assert_eq!(history_args(&json!({})).unwrap(), (None, None));
+    }
+
+    #[test]
+    fn task_approve_rejects_typo_in_from() {
+        let err = dispatch_tool("pivx_task_approve", &json!({"id_or_url": "5", "worker": "w", "from": "pubic"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("private") && err.contains("public"), "{err}");
     }
 }

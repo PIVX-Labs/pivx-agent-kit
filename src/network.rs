@@ -100,6 +100,33 @@ impl PivxNetwork {
         Err(last_err.into())
     }
 
+    /// Is `txid` known to the network (confirmed or in the mempool)?
+    ///
+    /// Asks Blockbook explorers and PIVX Core RPC nodes alternately and
+    /// stops as soon as the answer is settled (see [`decide_tx_exists`]):
+    /// one "found", or two independent "not found"s.
+    pub fn tx_exists(&self, txid: &str) -> Result<bool, Box<dyn Error>> {
+        let mut answers = Vec::new();
+        let n = self.explorers.len().max(self.rpc_nodes.len());
+        for i in 0..n {
+            if let Some(explorer) = self.explorers.get(i) {
+                let url = format!("{}/api/v2/tx/{}", explorer, txid);
+                answers.push(lookup(&url, |code, body| classify_explorer_tx(code, body, txid)));
+            }
+            if let Ok(found) = decide_tx_exists(&answers) {
+                return Ok(found);
+            }
+            if let Some(node) = self.rpc_nodes.get(i) {
+                let url = format!("{}/getrawtransaction?params={}", node, txid);
+                answers.push(lookup(&url, |code, body| classify_rpc_tx(code, body, txid)));
+            }
+            if let Ok(found) = decide_tx_exists(&answers) {
+                return Ok(found);
+            }
+        }
+        decide_tx_exists(&answers).map_err(|e| e.into())
+    }
+
     /// Broadcast a raw transaction hex
     pub fn send_transaction(&self, tx_hex: &str) -> Result<String, Box<dyn Error>> {
         let mut last_err = String::from("Failed to broadcast");
@@ -153,6 +180,116 @@ impl PivxNetwork {
             }
         }
         Err(format!("Broadcast failed — explorers: {}, RPC: {}", last_err, rpc_err).into())
+    }
+}
+
+/// Outcome of one source's answer to "do you know this txid?".
+#[derive(Debug, PartialEq)]
+pub enum TxLookup {
+    Found,
+    NotFound,
+    /// Anything else: transport error, 5xx, unexpected body.
+    Unknown(String),
+}
+
+/// Upper bound on how long a send can run between writing its ledger
+/// intent and recording the outcome: every broadcast endpoint timing
+/// out, then every lookup endpoint timing out. The ledger's in-flight
+/// window must exceed this.
+pub const WORST_CASE_SEND_SECS: u64 =
+    ((EXPLORERS.len() + RPC_NODES.len()) * 2) as u64 * REQUEST_TIMEOUT.as_secs();
+
+/// Classify Blockbook `GET /api/v2/tx/<txid>`. Found only if the body
+/// is that transaction — a proxy or captive portal answering 200 must
+/// not count. Unknown txids get 400 `{"error":"Transaction '…' not found"}`.
+pub fn classify_explorer_tx(status: u16, body: &str, txid: &str) -> TxLookup {
+    match status {
+        200 => {
+            let reported = serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| v.get("txid").and_then(|t| t.as_str()).map(|t| t.to_ascii_lowercase()));
+            if reported.as_deref() == Some(txid.to_ascii_lowercase().as_str()) {
+                TxLookup::Found
+            } else {
+                TxLookup::Unknown(format!("explorer answered 200 without transaction {}", txid))
+            }
+        }
+        400 if body.contains("not found") => TxLookup::NotFound,
+        _ => TxLookup::Unknown(format!("HTTP {}: {}", status, snippet(body))),
+    }
+}
+
+/// Classify PIVX Core `getrawtransaction <txid>` via the RPC proxy.
+/// Found only if the returned hex hashes to `txid`. Unknown txids get
+/// an error body "No such mempool or blockchain transaction".
+pub fn classify_rpc_tx(status: u16, body: &str, txid: &str) -> TxLookup {
+    if body.contains("No such mempool or blockchain transaction") {
+        return TxLookup::NotFound;
+    }
+    if status == 200 {
+        let hashes_to_txid = serde_json::from_str::<String>(body)
+            .ok()
+            .and_then(|hex| crate::spend::compute_txid(&hex).ok())
+            .is_some_and(|t| t.eq_ignore_ascii_case(txid));
+        if hashes_to_txid {
+            return TxLookup::Found;
+        }
+        return TxLookup::Unknown(format!("RPC answered 200 without transaction {}", txid));
+    }
+    TxLookup::Unknown(format!("HTTP {}: {}", status, snippet(body)))
+}
+
+fn snippet(body: &str) -> String {
+    body.chars().take(200).collect()
+}
+
+/// Combine answers: any `Found` → true. `false` needs at least two
+/// definite "not found" answers — callers use it to decide it's safe to
+/// pay again, so one lagging source must not decide alone. Otherwise
+/// the outcome is unknown.
+pub fn decide_tx_exists(answers: &[TxLookup]) -> Result<bool, String> {
+    if answers.contains(&TxLookup::Found) {
+        return Ok(true);
+    }
+    let not_found = answers.iter().filter(|a| **a == TxLookup::NotFound).count();
+    if not_found >= 2 {
+        return Ok(false);
+    }
+    let errors: Vec<&str> = answers
+        .iter()
+        .filter_map(|a| match a {
+            TxLookup::Unknown(e) => Some(e.as_str()),
+            _ => None,
+        })
+        .collect();
+    Err(format!(
+        "can't confirm whether the transaction exists ({} of 2 needed sources said not found; errors: {})",
+        not_found,
+        if errors.is_empty() { "none".to_string() } else { errors.join("; ") }
+    ))
+}
+
+/// GET `url` and classify the response with `classify(status, body)`.
+fn lookup(url: &str, classify: impl Fn(u16, &str) -> TxLookup) -> TxLookup {
+    match ureq::get(url).timeout(REQUEST_TIMEOUT).call() {
+        Ok(resp) => {
+            let code = resp.status();
+            classify(code, &resp.into_string().unwrap_or_default())
+        }
+        Err(ureq::Error::Status(code, resp)) => classify(code, &resp.into_string().unwrap_or_default()),
+        Err(e) => TxLookup::Unknown(e.to_string()),
+    }
+}
+
+impl crate::payment::Network for PivxNetwork {
+    fn broadcast(&self, txhex: &str) -> Result<String, Box<dyn Error>> {
+        self.send_transaction(txhex)
+    }
+}
+
+impl crate::ledger::ChainLookup for PivxNetwork {
+    fn tx_exists(&self, txid: &str) -> Result<bool, Box<dyn Error>> {
+        PivxNetwork::tx_exists(self, txid)
     }
 }
 
@@ -213,4 +350,91 @@ fn download_with_progress(
         }
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TXID: &str = "0ef9a5928d3d15fbf1a39d0b4339cd70180194db78f90cbe6bc3e63268d578c2";
+
+    fn fixture_hex() -> String {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/mainnet_tx_v1_transparent.json")).unwrap();
+        v["hex"].as_str().unwrap().to_string()
+    }
+
+    // -------- explorer --------------------------------------------
+
+    #[test]
+    fn explorer_found_requires_matching_txid_in_body() {
+        let body = format!("{{\"txid\":\"{}\",\"version\":1}}", TXID);
+        assert_eq!(classify_explorer_tx(200, &body, TXID), TxLookup::Found);
+        let other = format!("{{\"txid\":\"{}\"}}", "ab".repeat(32));
+        assert!(matches!(classify_explorer_tx(200, &other, TXID), TxLookup::Unknown(_)));
+        assert!(matches!(classify_explorer_tx(200, "<html>captive portal</html>", TXID), TxLookup::Unknown(_)));
+        assert!(matches!(classify_explorer_tx(200, "", TXID), TxLookup::Unknown(_)));
+    }
+
+    #[test]
+    fn explorer_not_found_on_blockbook_400() {
+        let body = format!("{{\"error\":\"Transaction '{}' not found\"}}", TXID);
+        assert_eq!(classify_explorer_tx(400, &body, TXID), TxLookup::NotFound);
+    }
+
+    #[test]
+    fn explorer_other_errors_are_unknown() {
+        assert!(matches!(classify_explorer_tx(403, "Just a moment...", TXID), TxLookup::Unknown(_)));
+        assert!(matches!(classify_explorer_tx(500, "not found", TXID), TxLookup::Unknown(_)));
+        assert!(matches!(classify_explorer_tx(429, "rate limited", TXID), TxLookup::Unknown(_)));
+        assert!(matches!(classify_explorer_tx(400, "{\"error\":\"bad request\"}", TXID), TxLookup::Unknown(_)));
+    }
+
+    // -------- rpc -------------------------------------------------
+
+    #[test]
+    fn rpc_found_requires_hex_that_hashes_to_txid() {
+        let body = format!("\"{}\"", fixture_hex());
+        assert_eq!(classify_rpc_tx(200, &body, TXID), TxLookup::Found);
+        assert!(matches!(classify_rpc_tx(200, &body, &"ab".repeat(32)), TxLookup::Unknown(_)));
+        assert!(matches!(classify_rpc_tx(200, "\"zz\"", TXID), TxLookup::Unknown(_)));
+        assert!(matches!(classify_rpc_tx(200, "null", TXID), TxLookup::Unknown(_)));
+    }
+
+    #[test]
+    fn rpc_not_found_message() {
+        let body = "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.";
+        assert_eq!(classify_rpc_tx(502, body, TXID), TxLookup::NotFound);
+        assert_eq!(classify_rpc_tx(500, body, TXID), TxLookup::NotFound);
+    }
+
+    #[test]
+    fn rpc_other_errors_are_unknown() {
+        assert!(matches!(classify_rpc_tx(403, "Invalid RPC", TXID), TxLookup::Unknown(_)));
+        assert!(matches!(classify_rpc_tx(502, "Bad Gateway", TXID), TxLookup::Unknown(_)));
+    }
+
+    // -------- combining -------------------------------------------
+
+    #[test]
+    fn any_found_wins() {
+        use TxLookup::*;
+        assert_eq!(decide_tx_exists(&[NotFound, NotFound, Found]), Ok(true));
+        assert_eq!(decide_tx_exists(&[Unknown("x".into()), Found]), Ok(true));
+    }
+
+    #[test]
+    fn not_found_needs_two_sources() {
+        use TxLookup::*;
+        assert_eq!(decide_tx_exists(&[NotFound, NotFound]), Ok(false));
+        assert_eq!(decide_tx_exists(&[NotFound, Unknown("down".into()), NotFound]), Ok(false));
+        assert!(decide_tx_exists(&[NotFound]).is_err());
+        assert!(decide_tx_exists(&[NotFound, Unknown("down".into())]).is_err());
+        assert!(decide_tx_exists(&[]).is_err());
+    }
+
+    #[test]
+    fn worst_case_send_counts_every_endpoint_twice() {
+        assert_eq!(WORST_CASE_SEND_SECS, 6 * 2 * 30);
+    }
 }
