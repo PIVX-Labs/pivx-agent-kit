@@ -1,7 +1,9 @@
 [package]
 name = "pivx-agent-kit"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
+# std::fs::File::lock (spend lock)
+rust-version = "1.89"
 description = "PIVX Agent Kit – CLI toolbox for AI agents to interact with the PIVX blockchain"
 repository = "https://github.com/PIVX-Labs/pivx-agent-kit"
 license = "MIT"
@@ -28,6 +30,8 @@ ureq = "2"
 
 # Cryptographic utilities still needed at the CLI layer for device-bound key derivation.
 sha2 = "0.10"
+# HMAC over the spending policy file (tamper evidence).
+hmac = "0.12"
 zeroize = { version = "1.8", features = ["derive"] }
 
 # System

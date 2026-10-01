@@ -31,6 +31,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::client::{url_encode, Client};
 use super::state::{self, OrderEntry};
 use crate::core;
+use crate::ledger::{self, Ledger};
+use crate::network::PivxNetwork;
+use crate::spend::{Origin, Pool, SendRequest};
 use crate::wallet;
 
 type Result = std::result::Result<Value, Box<dyn Error>>;
@@ -260,8 +263,19 @@ pub fn order_cancel(args: &[String]) -> Result {
 /// `core::send`, which will surface its own insufficient-funds
 /// error if the chosen pool is short.
 pub fn order_pay(args: &[String]) -> Result {
+    order_pay_with(args, None)
+}
+
+/// Replay of an operator-approved card payment (`pending approve`). The
+/// order is re-checked, so an expired order fails cleanly.
+pub(crate) fn order_pay_approved(order_id: &str, from: Pool, pending_id: &str) -> Result {
+    let args = vec![order_id.to_string(), "--from".into(), from.to_string()];
+    order_pay_with(&args, Some(pending_id))
+}
+
+fn order_pay_with(args: &[String], approval: Option<&str>) -> Result {
     let mut id: Option<String> = None;
-    let mut from_explicit: Option<String> = None;
+    let mut from_explicit: Option<Pool> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -269,10 +283,7 @@ pub fn order_pay(args: &[String]) -> Result {
                 let v = args
                     .get(i + 1)
                     .ok_or("--from requires a value (private|public)")?;
-                if v != "private" && v != "public" {
-                    return Err("--from must be 'private' or 'public'".into());
-                }
-                from_explicit = Some(v.to_string());
+                from_explicit = Some(v.parse::<Pool>()?);
                 i += 2;
             }
             other if !other.starts_with("--") && id.is_none() => {
@@ -283,6 +294,25 @@ pub fn order_pay(args: &[String]) -> Result {
         }
     }
     let id = id.ok_or("Usage: cards order pay <order-id> [--from private|public]")?;
+
+    // Double-pay guard: PIVCards can keep reporting PENDING while the
+    // first payment sits unconfirmed, so the status check below isn't
+    // enough on its own to stop a retry from paying twice.
+    let origin = Origin::CardsPay { order_id: normalize_order_id(&id) };
+    if let Some(txid) = ledger::prior_payment(
+        &Ledger::open_default(),
+        &core::wallet_address()?,
+        &origin,
+        &PivxNetwork::new(),
+        core::now_secs(),
+    )? {
+        return Ok(json!({
+            "order_id": id,
+            "already_paid": true,
+            "txid": txid,
+            "_hint": "This wallet already paid this order. Poll `cards order check <order-id>` until status_num == 5 (COMPLETE).",
+        }));
+    }
 
     let order = Client::new().get(&format!("/api/v1/order/check?id={}", url_encode(&id)))?;
 
@@ -326,10 +356,43 @@ pub fn order_pay(args: &[String]) -> Result {
         None => (auto_select_pool(amount_sat)?, true),
     };
 
-    let send_result = core::send(&payment_address, amount_sat, "", &from)?;
+    let req = SendRequest {
+        address: payment_address.clone(),
+        amount_sat,
+        memo: String::new(),
+        from,
+        reason: Some(order_reason(&id)),
+        origin,
+        price: None,
+    };
+    let send_result = match approval {
+        Some(pending_id) => core::send_approved(&req, pending_id)?,
+        None => core::send(&req)?,
+    };
 
+    // Held by the spending policy. PIVCards invoices expire, so say so.
+    if send_result.get("status").and_then(|v| v.as_str()) == Some("pending_approval") {
+        let mut held = send_result;
+        held["order_id"] = json!(id);
+        held["order_expiry_utc"] = order.get("serverTimeExpiry").cloned().unwrap_or(Value::Null);
+        return Ok(held);
+    }
+
+    // Another process paid this order between the check above and the
+    // send's own check under the spend lock.
+    if send_result.get("status").and_then(|v| v.as_str()) == Some("already_paid") {
+        return Ok(json!({
+            "order_id": id,
+            "already_paid": true,
+            "txid": send_result.get("txid"),
+            "_hint": "This wallet already paid this order. Poll `cards order check <order-id>` until status_num == 5 (COMPLETE).",
+        }));
+    }
+
+    let amount_usd = send_result.get("amount_usd").cloned();
     Ok(json!({
         "order_id": id,
+        "amount_usd": amount_usd,
         "from": from,
         "from_auto_selected": auto_chosen,
         "amount_piv": amount_piv,
@@ -346,7 +409,7 @@ pub fn order_pay(args: &[String]) -> Result {
 /// more expensive (shield) path so the same threshold works for
 /// either pool — better to over-reserve and pick public than to
 /// pick private and trip an insufficient-fee error mid-build.
-fn auto_select_pool(amount_sat: u64) -> std::result::Result<String, Box<dyn Error>> {
+fn auto_select_pool(amount_sat: u64) -> std::result::Result<Pool, Box<dyn Error>> {
     // 0.05 PIV — comfortably above the ~0.022 PIV shield-spend fee
     // we observed on the live Viettel purchase, with margin for
     // network-fee bumps. Transparent fees are tiny (~0.0002 PIV)
@@ -365,10 +428,10 @@ fn auto_select_pool(amount_sat: u64) -> std::result::Result<String, Box<dyn Erro
     let needed = amount_sat.saturating_add(FEE_BUFFER_SAT);
 
     if private_sat >= needed {
-        return Ok("private".to_string());
+        return Ok(Pool::Private);
     }
     if public_sat >= needed {
-        return Ok("public".to_string());
+        return Ok(Pool::Public);
     }
 
     // Neither pool covers it on its own. Splitting across pools
@@ -439,6 +502,32 @@ fn shape_order(raw: &Value) -> Value {
     })
 }
 
+/// Canonical form of an order id for the double-pay guard: trimmed,
+/// and lowercased when it's hex, so `ABC…` and `abc…` are one order.
+pub(crate) fn normalize_order_id(id: &str) -> String {
+    let t = id.trim();
+    if !t.is_empty() && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        t.to_ascii_lowercase()
+    } else {
+        t.to_string()
+    }
+}
+
+/// History reason for paying `order_id`, naming the card when the order
+/// is in the local cache.
+fn order_reason(order_id: &str) -> String {
+    let short: String = order_id.chars().take(12).collect();
+    match state::list_orders().into_iter().find(|o| o.id == order_id) {
+        Some(o) => format!(
+            "PIVCards order {} ({}{})",
+            short,
+            o.item_slug.unwrap_or_default(),
+            o.amount.map(|a| format!(" {}", a.trim())).unwrap_or_default()
+        ),
+        None => format!("PIVCards order {}", short),
+    }
+}
+
 fn current_transparent_address() -> std::result::Result<String, Box<dyn Error>> {
     let wallet_data = wallet::load_wallet()
         .map_err(|e| format!("cannot load wallet (run `init` or `import` first): {}", e))?;
@@ -451,4 +540,17 @@ fn now_unix_secs() -> Option<u64> {
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn order_ids_normalize_for_the_guard() {
+        assert_eq!(normalize_order_id("  ABCDEF0123  "), "abcdef0123");
+        assert_eq!(normalize_order_id("abcdef0123"), "abcdef0123");
+        // Non-hex ids keep their case (they may be case-sensitive upstream).
+        assert_eq!(normalize_order_id(" Order-XYZ "), "Order-XYZ");
+    }
 }

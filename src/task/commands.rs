@@ -13,6 +13,9 @@ use std::path::Path;
 use super::client::Client;
 use super::state;
 use crate::core;
+use crate::ledger::{self, Ledger};
+use crate::network::PivxNetwork;
+use crate::spend::{Origin, Pool, SendRequest};
 
 // ---------------------------------------------------------------------
 // id-or-url parsing
@@ -167,6 +170,7 @@ pub fn submit(args: &[String]) -> Result<Value, Box<dyn Error>> {
     let mut files: Vec<(&str, String, String, Vec<u8>)> = Vec::new();
     for path in &file_paths {
         let p = Path::new(path);
+        check_attachment(p)?;
         let bytes = fs::read(p).map_err(|e| format!("read {}: {}", path, e))?;
         let raw_filename = p
             .file_name()
@@ -468,13 +472,23 @@ pub fn create(args: &[String]) -> Result<Value, Box<dyn Error>> {
 // ---------------------------------------------------------------------
 
 pub fn approve(args: &[String]) -> Result<Value, Box<dyn Error>> {
+    approve_with(args, None)
+}
+
+/// Replay of an operator-approved bounty payment (`pending approve`).
+pub(crate) fn approve_approved(task_id: i64, worker: &str, from: Pool, pending_id: &str) -> Result<Value, Box<dyn Error>> {
+    let args = vec![task_id.to_string(), "--worker".into(), worker.to_string(), "--from".into(), from.to_string()];
+    approve_with(&args, Some(pending_id))
+}
+
+fn approve_with(args: &[String], approval: Option<&str>) -> Result<Value, Box<dyn Error>> {
     let id_arg = args
         .first()
         .ok_or("Usage: pivx-agent-kit task approve <id-or-url> --worker <handle> [--from public|private] [--txid <hex>]")?;
     let id = parse_task_id(id_arg)?;
 
     let mut worker: Option<String> = None;
-    let mut from = "public".to_string();
+    let mut from = Pool::Public;
     let mut external_txid: Option<String> = None;
 
     let mut i = 1;
@@ -487,8 +501,8 @@ pub fn approve(args: &[String]) -> Result<Value, Box<dyn Error>> {
             "--from" => {
                 from = args
                     .get(i + 1)
-                    .cloned()
-                    .unwrap_or_else(|| "public".to_string());
+                    .ok_or("--from requires a value (private|public)")?
+                    .parse::<Pool>()?;
                 i += 2;
             }
             "--txid" => {
@@ -501,6 +515,10 @@ pub fn approve(args: &[String]) -> Result<Value, Box<dyn Error>> {
     let worker = worker.ok_or("--worker <handle> is required")?;
 
     let client = Client::new();
+    // Set once the kit has paid (or found an earlier payment for) this
+    // approval, so a failure recording it with the platform says so.
+    let mut paid_by_kit = false;
+    let mut reused_payment = false;
 
     let txid = if let Some(t) = external_txid {
         // Cheap kit-side format check so a malformed --txid fails
@@ -518,61 +536,136 @@ pub fn approve(args: &[String]) -> Result<Value, Box<dyn Error>> {
         }
         trimmed.to_string()
     } else {
-        // Auto-pay path: figure out the bounty + the worker's address,
-        // then broadcast a payment via the kit's wallet.
-        let task = client.get_public(&format!("/api/tasks/{}", id))?;
-        let bounty_sat = task
-            .get("bounty_sat")
-            .and_then(|v| v.as_i64())
-            .ok_or("could not determine bounty_sat for task")?;
-        if bounty_sat <= 0 {
-            return Err("task has no bounty to pay".into());
+        // Double-pay guard: if an earlier run already paid this worker
+        // for this task (e.g. the platform call below failed last time),
+        // reuse that payment instead of sending another.
+        let origin = Origin::TaskApprove { task_id: id, worker: worker.clone() };
+        let prior = ledger::prior_payment(
+            &Ledger::open_default(),
+            &core::wallet_address()?,
+            &origin,
+            &PivxNetwork::new(),
+            core::now_secs(),
+        )?;
+        match prior {
+            Some(t) => {
+                paid_by_kit = true;
+                reused_payment = true;
+                t
+            }
+            None => {
+                // Auto-pay path: figure out the bounty + the worker's
+                // address, then broadcast a payment via the kit's wallet.
+                let task = client.get_public(&format!("/api/tasks/{}", id))?;
+                let bounty_sat = task
+                    .get("bounty_sat")
+                    .and_then(|v| v.as_i64())
+                    .ok_or("could not determine bounty_sat for task")?;
+                if bounty_sat <= 0 {
+                    return Err("task has no bounty to pay".into());
+                }
+
+                // Worker address is only revealed to the authed creator
+                // on /proofs. (The public task view hides addresses.)
+                let proofs = client.get_signed(&format!("/api/tasks/{}/proofs", id))?;
+                let address = proofs
+                    .get("commitments")
+                    .and_then(|cs| cs.as_array())
+                    .and_then(|cs| {
+                        cs.iter().find_map(|c| {
+                            let cm = c.get("commitment")?;
+                            let h = cm.get("worker_handle")?.as_str()?;
+                            if h == worker {
+                                cm.get("worker_address")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "could not find worker {:?} on task {}; check the handle",
+                            worker, id
+                        )
+                    })?;
+
+                let req = SendRequest {
+                    address,
+                    amount_sat: bounty_sat as u64,
+                    memo: String::new(),
+                    from,
+                    reason: Some(format!("Bounty for task #{} to {}", id, worker)),
+                    origin,
+                    price: None,
+                };
+                let send_resp = match approval {
+                    Some(pending_id) => core::send_approved(&req, pending_id)?,
+                    None => core::send(&req)?,
+                };
+                // Held by the spending policy: don't tell the platform
+                // anything until the operator approves and it's paid.
+                if send_resp.get("status").and_then(|v| v.as_str()) == Some("pending_approval") {
+                    return Ok(send_resp);
+                }
+                paid_by_kit = true;
+                // Another process may have paid between our check and the
+                // send's own check under the spend lock.
+                reused_payment = send_resp.get("status").and_then(|v| v.as_str()) == Some("already_paid");
+                send_resp
+                    .get("txid")
+                    .and_then(|v| v.as_str())
+                    .ok_or("send returned no txid")?
+                    .to_string()
+            }
         }
-
-        // Worker address is only revealed to the authed creator on
-        // /proofs. (The public task view hides addresses.)
-        let proofs = client.get_signed(&format!("/api/tasks/{}/proofs", id))?;
-        let address = proofs
-            .get("commitments")
-            .and_then(|cs| cs.as_array())
-            .and_then(|cs| {
-                cs.iter().find_map(|c| {
-                    let cm = c.get("commitment")?;
-                    let h = cm.get("worker_handle")?.as_str()?;
-                    if h == worker {
-                        cm.get("worker_address")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    } else {
-                        None
-                    }
-                })
-            })
-            .ok_or_else(|| {
-                format!(
-                    "could not find worker {:?} on task {}; check the handle",
-                    worker, id
-                )
-            })?;
-
-        let send_resp = core::send(&address, bounty_sat as u64, "", &from)?;
-        send_resp
-            .get("txid")
-            .and_then(|v| v.as_str())
-            .ok_or("send returned no txid")?
-            .to_string()
     };
 
     let body = json!({ "worker": worker, "txid": txid });
-    let resp = client.post_signed_json(&format!("/api/tasks/{}/approve", id), &body)?;
+    let resp = match client.post_signed_json(&format!("/api/tasks/{}/approve", id), &body) {
+        Ok(r) => r,
+        // An operator-approved replay that paid: report the payment, not
+        // a failure, so `pending list` doesn't read as "not sent".
+        Err(e) if paid_by_kit && approval.is_some() => {
+            return Ok(json!({
+                "status": "paid_not_recorded",
+                "txid": txid,
+                "reused_payment": reused_payment,
+                "error": approve_after_payment_error(&e.to_string(), &txid, reused_payment),
+            }));
+        }
+        Err(e) if paid_by_kit => return Err(approve_after_payment_error(&e.to_string(), &txid, reused_payment).into()),
+        Err(e) => return Err(e),
+    };
 
     // Surface the txid in the response so an agent doesn't have to
     // dig back through balance/send output to find it.
     let mut out = resp;
     if let Some(map) = out.as_object_mut() {
         map.insert("txid".into(), json!(txid));
+        map.insert("reused_payment".into(), json!(reused_payment));
     }
     Ok(out)
+}
+
+/// Error to surface when the bounty went out but the platform call to
+/// record the approval failed. Must name the txid and make clear a
+/// retry is safe (the ledger guard reuses the payment).
+pub(crate) fn approve_after_payment_error(err: &str, txid: &str, reused: bool) -> String {
+    if reused {
+        format!(
+            "{} — this approval reused an earlier bounty payment (txid {}), so the platform may already \
+             have recorded it. Check `task get <id>` before retrying; the kit will not pay again either way.",
+            err, txid
+        )
+    } else {
+        format!(
+            "{} — the bounty was paid (txid {}) but the platform may not have recorded the approval. \
+             Re-run the same approve command: the kit finds the payment in `history` and will not pay again.",
+            err, txid
+        )
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -718,6 +811,30 @@ fn parse_f64_flag(flag: &str, raw: Option<&String>) -> Result<f64, Box<dyn Error
     let s = raw.ok_or_else(|| format!("{} requires a value", flag))?;
     s.parse::<f64>()
         .map_err(|_| format!("{} value {:?} is not a number", flag, s).into())
+}
+
+fn is_machine_id_path(p: &Path) -> bool {
+    p == Path::new("/etc/machine-id") || p == Path::new("/var/lib/dbus/machine-id")
+}
+
+/// Refuse attachments that would leak the wallet: anything inside the
+/// kit's data directory (wallet.json, ledger, policy) and the machine-id
+/// files the wallet's device key is derived from. Resolves symlinks
+/// first, so a link elsewhere pointing at them is refused too.
+pub(crate) fn check_attachment(path: &Path) -> Result<(), String> {
+    let real = fs::canonicalize(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let data_dir = crate::wallet::get_data_dir();
+    let data_dir = fs::canonicalize(&data_dir).unwrap_or(data_dir);
+    if real.starts_with(&data_dir) {
+        return Err(format!(
+            "refusing to attach {}: it's inside the wallet's data directory (wallet keys, history, limits)",
+            path.display()
+        ));
+    }
+    if is_machine_id_path(&real) || is_machine_id_path(path) {
+        return Err(format!("refusing to attach {}: the wallet's encryption key is derived from it", path.display()));
+    }
+    Ok(())
 }
 
 fn mime_for_path(p: &Path) -> &'static str {
@@ -938,6 +1055,78 @@ mod tests {
             let blocked = name.chars().any(|c| c == '"' || c == '\\' || c == '\r' || c == '\n');
             assert!(!blocked, "rejected legitimate filename: {:?}", name);
         }
+    }
+
+    // -------- attachments can't leak the wallet ---------------------
+
+    #[test]
+    fn attachments_inside_the_data_dir_are_refused() {
+        let dir = crate::wallet::get_data_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let wallet = dir.join("wallet.json");
+        std::fs::write(&wallet, "{}").unwrap();
+        let err = check_attachment(&wallet).unwrap_err();
+        assert!(err.contains("wallet"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_into_the_data_dir_are_refused() {
+        let dir = crate::wallet::get_data_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("ledger.jsonl");
+        std::fs::write(&target, "").unwrap();
+        let link = crate::ledger::tests::temp_dir("attach-link").join("proof.png");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(check_attachment(&link).is_err());
+    }
+
+    #[test]
+    fn machine_id_files_are_refused() {
+        for p in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+            assert!(check_attachment(Path::new(p)).is_err() || !Path::new(p).exists(), "{p}");
+        }
+        assert!(is_machine_id_path(Path::new("/etc/machine-id")));
+        assert!(is_machine_id_path(Path::new("/var/lib/dbus/machine-id")));
+        assert!(!is_machine_id_path(Path::new("/tmp/machine-id-notes.txt")));
+    }
+
+    #[test]
+    fn ordinary_files_are_allowed() {
+        let f = crate::ledger::tests::temp_dir("attach-ok").join("proof.png");
+        std::fs::write(&f, "png").unwrap();
+        assert!(check_attachment(&f).is_ok());
+    }
+
+    // -------- approve: payment-then-record failure -----------------
+
+    #[test]
+    fn approve_failure_message_after_new_payment() {
+        let txid = "ab".repeat(32);
+        let msg = approve_after_payment_error("HTTP 401: unauthorized", &txid, false);
+        assert!(msg.contains("HTTP 401: unauthorized"));
+        assert!(msg.contains(&txid));
+        assert!(msg.contains("will not pay"), "{msg}");
+        assert!(msg.contains("history"), "{msg}");
+    }
+
+    #[test]
+    fn approve_failure_message_when_reusing_payment_does_not_claim_unrecorded() {
+        // The platform may already have recorded the approval (e.g. "already approved").
+        let txid = "ab".repeat(32);
+        let msg = approve_after_payment_error("HTTP 409: already approved", &txid, true);
+        assert!(msg.contains("HTTP 409: already approved"));
+        assert!(msg.contains(&txid));
+        assert!(!msg.contains("didn't record"), "{msg}");
+        assert!(msg.contains("task get"), "should point at checking the task: {msg}");
+    }
+
+    #[test]
+    fn approve_rejects_typo_in_from_before_network() {
+        let err = approve(&["5".into(), "--worker".into(), "w".into(), "--from".into(), "pubic".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("private") && err.contains("public"), "{err}");
     }
 
     // -------- approve --txid validation ---------------------------
